@@ -96,6 +96,45 @@ class ChatMemberStateChange(enum.IntFlag):
     BANNED = 0x10
 
 
+class LobbyEnter(ctypes.Structure):
+    _fields_ = [
+        ("m_ulSteamIDLobby", ctypes.c_uint64),
+        ("m_rgfChatPermissions", ctypes.c_uint32),
+        # A one-byte C++ bool; the uint32 after it is padded to offset 16.
+        ("m_bLocked", ctypes.c_bool),
+        ("m_EChatRoomEnterResponse", ctypes.c_uint32),
+    ]
+
+
+LOBBY_ENTER = 504  # LobbyEnter_t::k_iCallback
+
+
+class ChatRoomEnterResponse(enum.IntEnum):
+    SUCCESS = 1
+    DOESNT_EXIST = 2
+    NOT_ALLOWED = 3
+    FULL = 4
+    ERROR = 5
+    BANNED = 6
+    LIMITED = 7
+    COMMUNITY_BAN = 9
+    MEMBER_BLOCKED_YOU = 10
+    YOU_BLOCKED_MEMBER = 11
+    RATELIMIT_EXCEEDED = 15
+
+
+# Both fields are CSteamID, a union with a uint64 declared under pack(1). Only
+# alignment differs from uint64, which doesn't change this struct's layout.
+class GameLobbyJoinRequested(ctypes.Structure):
+    _fields_ = [
+        ("m_steamIDLobby", ctypes.c_uint64),
+        ("m_steamIDFriend", ctypes.c_uint64),
+    ]
+
+
+GAME_LOBBY_JOIN_REQUESTED = 333  # GameLobbyJoinRequested_t::k_iCallback
+
+
 HSteamNetConnection = ctypes.c_uint32
 HSteamListenSocket = ctypes.c_uint32
 SteamNetworkingPOPID = ctypes.c_uint32
@@ -288,6 +327,9 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
             ctypes.c_uint64,
         ]
         lib.SteamAPI_ISteamMatchmaking_InviteUserToLobby.restype = ctypes.c_bool
+
+        lib.SteamAPI_ISteamMatchmaking_JoinLobby.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        lib.SteamAPI_ISteamMatchmaking_JoinLobby.restype = SteamAPICall_t
 
         lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.argtypes = []
         lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.restype = ctypes.c_void_p

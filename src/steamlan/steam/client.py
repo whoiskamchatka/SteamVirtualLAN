@@ -8,12 +8,15 @@ from steamlan.steam.loader import load_steam_api
 from steamlan.steam.native import (
     API_CALL_INVALID,
     LOBBY_CREATED,
+    LOBBY_ENTER,
     NET_HANDLE_INVALID,
     SEND_RELIABLE,
     STEAM_API_CALL_COMPLETED,
     CallbackMsg,
+    ChatRoomEnterResponse,
     EResult,
     LobbyCreated,
+    LobbyEnter,
     LobbyType,
     SteamAPICallCompleted,
     SteamAPIInitResult,
@@ -113,6 +116,27 @@ def _read_lobby_created(callback: SteamCallback) -> int:
     if not created.m_ulSteamIDLobby:
         raise SteamError("CreateLobby succeeded but returned no lobby ID")
     return created.m_ulSteamIDLobby
+
+
+def _read_lobby_enter(callback: SteamCallback, lobby_id: int) -> int:
+    if callback.failed:
+        raise SteamError("JoinLobby failed: Steam could not deliver the result")
+    if callback.callback_id != LOBBY_ENTER:
+        raise SteamError(f"JoinLobby returned unexpected callback {callback.callback_id}")
+    if len(callback.payload) != ctypes.sizeof(LobbyEnter):
+        raise SteamError(f"JoinLobby returned {len(callback.payload)} bytes for LobbyEnter_t")
+
+    entered = LobbyEnter.from_buffer_copy(callback.payload)
+    response = entered.m_EChatRoomEnterResponse
+    if response != ChatRoomEnterResponse.SUCCESS:
+        try:
+            reason = ChatRoomEnterResponse(response).name
+        except ValueError:
+            reason = f"response {response}"
+        raise SteamError(f"JoinLobby failed: {reason}")
+    if entered.m_ulSteamIDLobby != lobby_id:
+        raise SteamError("JoinLobby entered a different lobby than requested")
+    return entered.m_ulSteamIDLobby
 
 
 def _check_steam_id(steam_id: int, what: str) -> None:
@@ -232,6 +256,15 @@ class SteamClient:
             raise SteamError("CreateLobby could not be started")
 
         return _read_lobby_created(self._wait_for_call(api_call, timeout))
+
+    def join_lobby(self, lobby_id: int, timeout: float = 10.0) -> int:
+        lib = self._running_lib()
+        _check_steam_id(lobby_id, "lobby ID")
+        api_call = lib.SteamAPI_ISteamMatchmaking_JoinLobby(self._matchmaking(lib), lobby_id)
+        if api_call == API_CALL_INVALID:
+            raise SteamError("JoinLobby could not be started")
+
+        return _read_lobby_enter(self._wait_for_call(api_call, timeout), lobby_id)
 
     def leave_lobby(self, lobby_id: int) -> None:
         lib = self._running_lib()

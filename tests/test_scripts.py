@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from steamlan.steam import ConnectionState, SteamCallback, SteamError
+from steamlan.steam import ConnectionState, LobbySession, Peer, SteamCallback, SteamError
 from steamlan.steam.native import (
     CONNECTION_STATUS_CHANGED,
+    GAME_LOBBY_JOIN_REQUESTED,
+    GameLobbyJoinRequested,
     SteamNetConnectionStatusChangedCallback,
 )
 
@@ -23,9 +25,11 @@ def scripts(monkeypatch):
         local=importlib.import_module("local_steam"),
         host=importlib.import_module("p2p_host"),
         guest=importlib.import_module("p2p_guest"),
+        lobby=importlib.import_module("lobby_p2p"),
     )
     monkeypatch.setattr(modules.host, "POLL_INTERVAL", 0)
     monkeypatch.setattr(modules.guest, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(modules.lobby, "POLL_INTERVAL", 0)
     return modules
 
 
@@ -204,3 +208,203 @@ def test_guest_host_close_timeout(scripts, monkeypatch):
 
     with pytest.raises(SteamError, match="did not confirm"):
         scripts.guest.wait_for_host_close(FakeSteam([]), 7)
+
+
+LOBBY_ID = 109775240917097000
+
+
+class FakeSession:
+    def __init__(self, peers, polls=()):
+        self.peers = {steam_id: Peer(steam_id, initiator) for steam_id, initiator in peers}
+        self.polls = list(polls)
+        self.connected = set()
+        self.sent = []
+
+    def poll(self):
+        return self.polls.pop(0) if self.polls else []
+
+    def connected_peers(self):
+        return sorted(self.connected)
+
+    def send(self, steam_id, data):
+        self.sent.append((steam_id, data))
+
+
+def test_initiator_sends_hello_once_after_connected(scripts):
+    session = FakeSession([(GUEST_ID, True)])
+    greeted = set()
+    log = []
+
+    scripts.lobby.hello_step(session, greeted, log.append)
+    assert session.sent == []
+
+    session.connected.add(GUEST_ID)
+    scripts.lobby.hello_step(session, greeted, log.append)
+    scripts.lobby.hello_step(session, greeted, log.append)
+
+    assert session.sent == [(GUEST_ID, scripts.lobby.HELLO)]
+    assert log == [f"Sent hello to {GUEST_ID}"]
+
+
+def test_accepting_side_answers_hello(scripts):
+    session = FakeSession([(HOST_ID, False)], polls=[[(HOST_ID, scripts.lobby.HELLO)]])
+    session.connected.add(HOST_ID)
+    log = []
+
+    scripts.lobby.hello_step(session, set(), log.append)
+
+    assert session.sent == [(HOST_ID, scripts.lobby.HELLO_ACK)]
+    assert f"P2P test succeeded with {HOST_ID}" in log
+
+
+def test_initiator_receives_ack(scripts):
+    session = FakeSession([(GUEST_ID, True)], polls=[[(GUEST_ID, scripts.lobby.HELLO_ACK)]])
+    session.connected.add(GUEST_ID)
+    log = []
+
+    scripts.lobby.hello_step(session, {GUEST_ID}, log.append)
+
+    assert session.sent == []
+    assert log == [f"Received ack from {GUEST_ID}", f"P2P test succeeded with {GUEST_ID}"]
+
+
+def test_other_data_is_only_reported(scripts):
+    session = FakeSession([(HOST_ID, False)], polls=[[(HOST_ID, b"\x00\x01")]])
+    log = []
+
+    scripts.lobby.hello_step(session, set(), log.append)
+
+    assert session.sent == []
+    assert log == [f"Received 2 bytes from {HOST_ID}"]
+
+
+class FakeLobbySteam:
+    def __init__(self, frames=()):
+        self.frames = list(frames)
+        self.calls = []
+
+    def run_callbacks(self):
+        return self.frames.pop(0) if self.frames else []
+
+    def create_lobby(self, max_members):
+        self.calls.append(("create_lobby", max_members))
+        return LOBBY_ID
+
+    def invite_to_lobby(self, lobby_id, friend_id):
+        self.calls.append(("invite_to_lobby", lobby_id, friend_id))
+
+    def join_lobby(self, lobby_id):
+        self.calls.append(("join_lobby", lobby_id))
+        return lobby_id
+
+
+def join_request(lobby_id=LOBBY_ID, friend_id=HOST_ID):
+    return SteamCallback(
+        GAME_LOBBY_JOIN_REQUESTED, bytes(GameLobbyJoinRequested(lobby_id, friend_id))
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "calls"),
+    [
+        (None, [("create_lobby", 8)]),
+        (GUEST_ID, [("create_lobby", 8), ("invite_to_lobby", LOBBY_ID, GUEST_ID)]),
+    ],
+)
+def test_host_enters_new_lobby(scripts, target, calls):
+    steam = FakeLobbySteam()
+
+    assert scripts.lobby.enter_lobby(steam, "host", target) == LOBBY_ID
+    assert steam.calls == calls
+
+
+def test_guest_joins_given_lobby(scripts):
+    steam = FakeLobbySteam(frames=[[join_request(lobby_id=LOBBY_ID + 1)]])
+
+    assert scripts.lobby.enter_lobby(steam, "guest", LOBBY_ID) == LOBBY_ID
+    assert steam.calls == [("join_lobby", LOBBY_ID)]
+
+
+def test_guest_joins_lobby_from_accepted_invite(scripts):
+    steam = FakeLobbySteam(frames=[[], [SteamCallback(304, b"")], [join_request()]])
+
+    assert scripts.lobby.enter_lobby(steam, "guest", None) == LOBBY_ID
+    assert steam.calls == [("join_lobby", LOBBY_ID)]
+
+
+class Network:
+    """Two or more fake Steam clients whose P2P calls reach each other."""
+
+    def __init__(self, *steam_ids):
+        self.members = list(steam_ids)
+        self.clients = {steam_id: LinkedSteam(steam_id, self) for steam_id in steam_ids}
+        self.links = {}
+        self.connects = []
+        self.last_handle = 0
+
+    def new_handle(self):
+        self.last_handle += 1
+        return self.last_handle
+
+
+class LinkedSteam:
+    def __init__(self, steam_id, network):
+        self.steam_id = steam_id
+        self.network = network
+        self.pending = []
+        self.inbox = {}
+
+    def lobby_members(self, lobby_id):
+        return list(self.network.members)
+
+    def run_callbacks(self):
+        callbacks, self.pending = self.pending, []
+        return callbacks
+
+    def connect_p2p(self, remote_steam_id, virtual_port=0):
+        network = self.network
+        mine, theirs = network.new_handle(), network.new_handle()
+        network.links[(self.steam_id, mine)] = (remote_steam_id, theirs)
+        network.links[(remote_steam_id, theirs)] = (self.steam_id, mine)
+        network.connects.append(self.steam_id)
+        self.pending.append(status(mine, ConnectionState.CONNECTING, 0, remote_steam_id))
+        network.clients[remote_steam_id].pending.append(
+            status(theirs, ConnectionState.CONNECTING, LISTEN_SOCKET, self.steam_id)
+        )
+        return mine
+
+    def accept_connection(self, connection):
+        remote, theirs = self.network.links[(self.steam_id, connection)]
+        self.pending.append(status(connection, ConnectionState.CONNECTED, LISTEN_SOCKET, remote))
+        self.network.clients[remote].pending.append(
+            status(theirs, ConnectionState.CONNECTED, 0, self.steam_id)
+        )
+
+    def send_message(self, connection, data):
+        remote, theirs = self.network.links[(self.steam_id, connection)]
+        self.network.clients[remote].inbox.setdefault(theirs, []).append(data)
+
+    def receive_messages(self, connection):
+        return self.inbox.pop(connection, [])
+
+    def close_connection(self, connection, debug=""):
+        return True
+
+
+@pytest.mark.parametrize(("first", "second"), [(HOST_ID, GUEST_ID), (GUEST_ID, HOST_ID)])
+def test_two_members_connect_and_exchange_hello(scripts, first, second):
+    network = Network(first, second)
+    logs = {steam_id: [] for steam_id in (first, second)}
+    sessions = {
+        steam_id: LobbySession(client, LOBBY_ID, LISTEN_SOCKET, log=logs[steam_id].append)
+        for steam_id, client in network.clients.items()
+    }
+    greeted = {steam_id: set() for steam_id in sessions}
+
+    for _ in range(6):
+        for steam_id, session in sessions.items():
+            scripts.lobby.hello_step(session, greeted[steam_id], logs[steam_id].append)
+
+    assert network.connects == [min(first, second)]
+    assert f"P2P test succeeded with {second}" in logs[first]
+    assert f"P2P test succeeded with {first}" in logs[second]

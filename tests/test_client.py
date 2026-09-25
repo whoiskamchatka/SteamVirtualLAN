@@ -13,10 +13,15 @@ from steamlan.steam import (
     SteamInitError,
 )
 from steamlan.steam.native import (
+    LOBBY_CHAT_UPDATE,
     LOBBY_CREATED,
+    LOBBY_ENTER,
     STEAM_API_CALL_COMPLETED,
+    ChatRoomEnterResponse,
     EResult,
+    LobbyChatUpdate,
     LobbyCreated,
+    LobbyEnter,
     SteamAPICallCompleted,
     SteamAPIInitResult,
     SteamErrMsg,
@@ -742,6 +747,7 @@ def test_close_drops_pending_callbacks(load, lib, clock, create_call):
 
 LOBBY_OPERATIONS = {
     "create_lobby": lambda steam: steam.create_lobby(4),
+    "join_lobby": lambda steam: steam.join_lobby(LOBBY_ID),
     "leave_lobby": lambda steam: steam.leave_lobby(LOBBY_ID),
     "invite_to_lobby": lambda steam: steam.invite_to_lobby(LOBBY_ID, OTHER_STEAM_ID),
     "lobby_member_count": lambda steam: steam.lobby_member_count(LOBBY_ID),
@@ -923,3 +929,141 @@ def test_networking_identity_empty_steam_id(steam, lib):
 
     with pytest.raises(SteamError, match="not a SteamID"):
         _ = steam.networking_steam_id
+
+
+JOIN_CALL = 0x7000
+
+
+@pytest.fixture
+def join_call(lib):
+    lib.SteamAPI_ISteamMatchmaking_JoinLobby.return_value = JOIN_CALL
+    return JOIN_CALL
+
+
+def lobby_entered(response=ChatRoomEnterResponse.SUCCESS, lobby_id=LOBBY_ID):
+    return bytes(LobbyEnter(lobby_id, 0, False, response))
+
+
+def lobby_enter_result(api_call=JOIN_CALL, size=24):
+    return call_completed(api_call, LOBBY_ENTER, size)
+
+
+def test_join_lobby(steam, lib, clock, join_call):
+    FakeCallbackQueue(lib, [lobby_enter_result()])
+    serve_call_results(lib, {JOIN_CALL: lobby_entered()})
+
+    lobby_id = steam.join_lobby(LOBBY_ID)
+
+    assert lobby_id == LOBBY_ID
+    assert type(lobby_id) is int
+    lib.SteamAPI_ISteamMatchmaking_JoinLobby.assert_called_once_with(MATCHMAKING, LOBBY_ID)
+    assert clock.slept == 0
+
+
+def test_join_lobby_keeps_ordinary_lobby_callbacks(steam, lib, clock, join_call):
+    ordinary_enter = lobby_entered()
+    member_update = bytes(LobbyChatUpdate(LOBBY_ID, STEAM_ID, STEAM_ID, 1))
+    other_result = lobby_entered(ChatRoomEnterResponse.FULL, lobby_id=111)
+    FakeCallbackQueue(
+        lib,
+        [
+            callback(LOBBY_ENTER, ordinary_enter),
+            callback(LOBBY_CHAT_UPDATE, member_update),
+            lobby_enter_result(OTHER_CALL),
+            lobby_enter_result(),
+            callback(304, b"after"),
+        ],
+    )
+    serve_call_results(lib, {JOIN_CALL: lobby_entered(), OTHER_CALL: other_result})
+
+    assert steam.join_lobby(LOBBY_ID) == LOBBY_ID
+
+    assert steam.run_callbacks() == [
+        SteamCallback(LOBBY_ENTER, ordinary_enter),
+        SteamCallback(LOBBY_CHAT_UPDATE, member_update),
+        SteamCallback(LOBBY_ENTER, other_result, api_call=OTHER_CALL),
+        SteamCallback(304, b"after"),
+    ]
+
+
+def test_join_lobby_waits_for_result(steam, lib, clock, join_call):
+    queue = FakeCallbackQueue(lib, [callback(LOBBY_ENTER, lobby_entered())])
+    serve_call_results(lib, {JOIN_CALL: lobby_entered()})
+    frames = []
+
+    def run_frame(pipe):
+        frames.append(pipe)
+        if len(frames) == 2:
+            queue.messages.append(lobby_enter_result())
+
+    lib.SteamAPI_ManualDispatch_RunFrame.side_effect = run_frame
+
+    assert steam.join_lobby(LOBBY_ID) == LOBBY_ID
+    assert len(frames) == 2
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (ChatRoomEnterResponse.FULL, "FULL"),
+        (ChatRoomEnterResponse.DOESNT_EXIST, "DOESNT_EXIST"),
+        (ChatRoomEnterResponse.NOT_ALLOWED, "NOT_ALLOWED"),
+        (99, "response 99"),
+    ],
+)
+def test_join_lobby_failed(steam, lib, clock, join_call, response, message):
+    FakeCallbackQueue(lib, [lobby_enter_result()])
+    serve_call_results(lib, {JOIN_CALL: lobby_entered(response)})
+
+    with pytest.raises(SteamError, match=f"JoinLobby failed: {message}"):
+        steam.join_lobby(LOBBY_ID)
+
+
+def test_join_lobby_entered_other_lobby(steam, lib, clock, join_call):
+    FakeCallbackQueue(lib, [lobby_enter_result()])
+    serve_call_results(lib, {JOIN_CALL: lobby_entered(lobby_id=111)})
+
+    with pytest.raises(SteamError, match="different lobby"):
+        steam.join_lobby(LOBBY_ID)
+
+
+def test_join_lobby_truncated_result(steam, lib, clock, join_call):
+    FakeCallbackQueue(lib, [lobby_enter_result(size=20)])
+    serve_call_results(lib, {JOIN_CALL: lobby_entered()[:20]})
+
+    with pytest.raises(SteamError, match="20 bytes for LobbyEnter_t"):
+        steam.join_lobby(LOBBY_ID)
+
+
+def test_join_lobby_unexpected_result_type(steam, lib, clock, join_call):
+    FakeCallbackQueue(lib, [call_completed(JOIN_CALL, LOBBY_CREATED, 16)])
+    serve_call_results(lib, {JOIN_CALL: lobby_created()})
+
+    with pytest.raises(SteamError, match="unexpected callback 513"):
+        steam.join_lobby(LOBBY_ID)
+
+
+def test_join_lobby_invalid_call(steam, lib, clock):
+    lib.SteamAPI_ISteamMatchmaking_JoinLobby.return_value = 0
+
+    with pytest.raises(SteamError, match="JoinLobby could not be started"):
+        steam.join_lobby(LOBBY_ID)
+
+    lib.SteamAPI_ManualDispatch_RunFrame.assert_not_called()
+
+
+def test_join_lobby_invalid_lobby_id(steam, lib):
+    with pytest.raises(ValueError, match="lobby ID"):
+        steam.join_lobby(0)
+
+    lib.SteamAPI_ISteamMatchmaking_JoinLobby.assert_not_called()
+
+
+def test_join_lobby_timeout(steam, lib, clock, join_call):
+    FakeCallbackQueue(lib, [callback(LOBBY_ENTER, lobby_entered())])
+
+    with pytest.raises(SteamError, match="timed out after 3s"):
+        steam.join_lobby(LOBBY_ID, timeout=3)
+
+    assert 3 <= clock.slept < 3.1
+    assert steam.run_callbacks() == [SteamCallback(LOBBY_ENTER, lobby_entered())]

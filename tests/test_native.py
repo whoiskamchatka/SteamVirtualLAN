@@ -6,17 +6,22 @@ import pytest
 from steamlan.steam import SteamAPILoadError
 from steamlan.steam.native import (
     CONNECTION_STATUS_CHANGED,
+    GAME_LOBBY_JOIN_REQUESTED,
     LOBBY_CHAT_UPDATE,
     LOBBY_CREATED,
+    LOBBY_ENTER,
     NET_HANDLE_INVALID,
     SEND_RELIABLE,
     CallbackMsg,
     ChatMemberStateChange,
+    ChatRoomEnterResponse,
     ConnectionState,
     EResult,
+    GameLobbyJoinRequested,
     HSteamPipe,
     LobbyChatUpdate,
     LobbyCreated,
+    LobbyEnter,
     LobbyType,
     SteamAPICallCompleted,
     SteamErrMsg,
@@ -153,6 +158,8 @@ def test_invite_signature():
 
 
 def test_lobby_callback_ids():
+    assert GAME_LOBBY_JOIN_REQUESTED == 300 + 33
+    assert LOBBY_ENTER == 500 + 4
     assert LOBBY_CHAT_UPDATE == 500 + 6
     assert LOBBY_CREATED == 500 + 13
 
@@ -323,6 +330,34 @@ def test_networking_constants():
         11,
         41,
     )
+
+
+def test_join_lobby_signature():
+    lib = bind(mock.Mock())
+
+    assert lib.SteamAPI_ISteamMatchmaking_JoinLobby.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+    ]
+    assert lib.SteamAPI_ISteamMatchmaking_JoinLobby.restype is ctypes.c_uint64
+
+
+def test_lobby_enter_layout():
+    assert ctypes.sizeof(LobbyEnter) == 24
+    assert offsets(LobbyEnter) == [0, 8, 12, 16]
+    assert ctypes.sizeof(ctypes.c_bool) == 1
+
+
+def test_game_lobby_join_requested_layout():
+    assert ctypes.sizeof(GameLobbyJoinRequested) == 16
+    assert offsets(GameLobbyJoinRequested) == [0, 8]
+
+
+def test_chat_room_enter_response_values():
+    assert ChatRoomEnterResponse.SUCCESS == 1
+    assert ChatRoomEnterResponse.DOESNT_EXIST == 2
+    assert ChatRoomEnterResponse.FULL == 4
+    assert ChatRoomEnterResponse.RATELIMIT_EXCEEDED == 15
 
 
 def test_missing_export():
