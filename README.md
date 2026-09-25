@@ -8,7 +8,7 @@ The project is still very early in development.
 
 ## Status
 
-Nothing usable yet. SteamVirtualLAN can currently load `steam_api64.dll`, initialize the Steam API and read the current user's name and SteamID through a small internal Python binding.
+Nothing usable yet. Through a small internal Python binding, SteamVirtualLAN can currently initialize the Steam API, read the current user's name and SteamID, pump Steam callbacks, and create and leave a Steam lobby.
 
 Windows is the initial target.
 
@@ -52,7 +52,7 @@ With Steam running and logged in:
 python scripts/check_steam.py
 ```
 
-The script initializes the Steam API, prints your Steam name and SteamID, and shuts it down again.
+The script initializes the Steam API, prints your Steam name and SteamID, creates a friends-only lobby, checks that you are a member, leaves it and shuts down again.
 
 ## Disclaimer
 

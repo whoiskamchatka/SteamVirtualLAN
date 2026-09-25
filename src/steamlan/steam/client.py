@@ -1,14 +1,27 @@
 import ctypes
 import os
+import time
+from dataclasses import dataclass
 
 from steamlan.steam.loader import load_steam_api
 from steamlan.steam.native import (
+    API_CALL_INVALID,
+    LOBBY_CREATED,
+    STEAM_API_CALL_COMPLETED,
+    CallbackMsg,
+    EResult,
+    LobbyCreated,
+    LobbyType,
+    SteamAPICallCompleted,
     SteamAPIInitResult,
     SteamErrMsg,
     bind,
     steam_friends,
+    steam_matchmaking,
     steam_user,
 )
+
+_CALL_POLL_INTERVAL = 0.01
 
 
 class SteamInitError(Exception):
@@ -17,6 +30,15 @@ class SteamInitError(Exception):
 
 class SteamError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class SteamCallback:
+    callback_id: int
+    payload: bytes
+    # Set for the result of an asynchronous call (SteamAPICall_t); 0 otherwise.
+    api_call: int = 0
+    failed: bool = False
 
 
 def _init_error_message(result: int, err: ctypes.Array[ctypes.c_char]) -> str:
@@ -29,10 +51,70 @@ def _init_error_message(result: int, err: ctypes.Array[ctypes.c_char]) -> str:
     return f"Steam API initialization failed: {detail}"
 
 
+def _read_callback(lib: ctypes.CDLL, pipe: int, msg: CallbackMsg) -> SteamCallback:
+    size = msg.m_cubParam
+    if size < 0 or (size and not msg.m_pubParam):
+        raise SteamError(f"Steam returned a malformed callback (id {msg.m_iCallback})")
+    payload = ctypes.string_at(msg.m_pubParam, size) if size else b""
+
+    if msg.m_iCallback != STEAM_API_CALL_COMPLETED:
+        return SteamCallback(msg.m_iCallback, payload)
+
+    if size < ctypes.sizeof(SteamAPICallCompleted):
+        raise SteamError("Steam returned a truncated SteamAPICallCompleted_t")
+    completed = SteamAPICallCompleted.from_buffer_copy(payload)
+
+    # Valve's manual dispatch loop fetches the call result while the completion
+    # callback is still the current one, i.e. before FreeLastCallback. Steam
+    # tells us the result's callback id and size.
+    result = ctypes.create_string_buffer(completed.m_cubParam)
+    io_failed = ctypes.c_bool()
+    ok = lib.SteamAPI_ManualDispatch_GetAPICallResult(
+        pipe,
+        completed.m_hAsyncCall,
+        result,
+        completed.m_cubParam,
+        completed.m_iCallback,
+        io_failed,
+    )
+    return SteamCallback(
+        completed.m_iCallback,
+        result.raw if ok else b"",
+        api_call=completed.m_hAsyncCall,
+        failed=not ok or io_failed.value,
+    )
+
+
+def _result_name(result: int) -> str:
+    try:
+        return EResult(result).name
+    except ValueError:
+        return f"result {result}"
+
+
+def _read_lobby_created(callback: SteamCallback) -> int:
+    if callback.failed:
+        raise SteamError("CreateLobby failed: Steam could not deliver the result")
+    if callback.callback_id != LOBBY_CREATED:
+        raise SteamError(f"CreateLobby returned unexpected callback {callback.callback_id}")
+    if len(callback.payload) != ctypes.sizeof(LobbyCreated):
+        raise SteamError(f"CreateLobby returned {len(callback.payload)} bytes for LobbyCreated_t")
+
+    created = LobbyCreated.from_buffer_copy(callback.payload)
+    if created.m_eResult != EResult.OK:
+        raise SteamError(f"CreateLobby failed: {_result_name(created.m_eResult)}")
+    if not created.m_ulSteamIDLobby:
+        raise SteamError("CreateLobby succeeded but returned no lobby ID")
+    return created.m_ulSteamIDLobby
+
+
 class SteamClient:
     def __init__(self, dll_path: str | os.PathLike[str]):
         self.dll_path = dll_path
         self._lib: ctypes.CDLL | None = None
+        # Callbacks received while waiting for a call result, returned by the
+        # next run_callbacks().
+        self._pending: list[SteamCallback] = []
 
     @property
     def running(self) -> bool:
@@ -50,6 +132,10 @@ class SteamClient:
         if result != SteamAPIInitResult.OK:
             raise SteamInitError(_init_error_message(result, err))
 
+        # Callbacks are delivered as plain messages instead of through C++
+        # callback objects. This must happen right after init, and
+        # SteamAPI_RunCallbacks must not be used from then on.
+        lib.SteamAPI_ManualDispatch_Init()
         self._lib = lib
 
     def close(self) -> None:
@@ -57,6 +143,7 @@ class SteamClient:
             return
 
         lib, self._lib = self._lib, None
+        self._pending = []
         lib.SteamAPI_Shutdown()
 
     @property
@@ -82,6 +169,85 @@ class SteamClient:
         if name is None:
             raise SteamError("Steam returned no persona name")
         return name.decode("utf-8", errors="replace")
+
+    def run_callbacks(self) -> list[SteamCallback]:
+        callbacks = self._pump(self._running_lib())
+        callbacks, self._pending = self._pending + callbacks, []
+        return callbacks
+
+    def create_lobby(
+        self,
+        max_members: int,
+        lobby_type: LobbyType = LobbyType.FRIENDS_ONLY,
+        timeout: float = 10.0,
+    ) -> int:
+        lib = self._running_lib()
+        api_call = lib.SteamAPI_ISteamMatchmaking_CreateLobby(
+            self._matchmaking(lib), lobby_type, max_members
+        )
+        if api_call == API_CALL_INVALID:
+            raise SteamError("CreateLobby could not be started")
+
+        return _read_lobby_created(self._wait_for_call(api_call, timeout))
+
+    def leave_lobby(self, lobby_id: int) -> None:
+        lib = self._running_lib()
+        lib.SteamAPI_ISteamMatchmaking_LeaveLobby(self._matchmaking(lib), lobby_id)
+
+    def lobby_member_count(self, lobby_id: int) -> int:
+        lib = self._running_lib()
+        count = lib.SteamAPI_ISteamMatchmaking_GetNumLobbyMembers(self._matchmaking(lib), lobby_id)
+        if count < 0:
+            raise SteamError(f"Steam returned an invalid lobby member count ({count})")
+        return count
+
+    def lobby_members(self, lobby_id: int) -> list[int]:
+        lib = self._running_lib()
+        matchmaking = self._matchmaking(lib)
+        members = [
+            lib.SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex(matchmaking, lobby_id, i)
+            for i in range(self.lobby_member_count(lobby_id))
+        ]
+        if not all(members):
+            raise SteamError("Steam returned an empty SteamID for a lobby member")
+        return members
+
+    def _wait_for_call(self, api_call: int, timeout: float) -> SteamCallback:
+        lib = self._running_lib()
+        deadline = time.monotonic() + timeout
+        while True:
+            result = None
+            for callback in self._pump(lib):
+                if result is None and callback.api_call == api_call:
+                    result = callback
+                else:
+                    self._pending.append(callback)
+            if result is not None:
+                return result
+            if time.monotonic() >= deadline:
+                raise SteamError(f"timed out after {timeout:g}s waiting for Steam API call")
+            time.sleep(_CALL_POLL_INTERVAL)
+
+    def _matchmaking(self, lib: ctypes.CDLL) -> int:
+        matchmaking = steam_matchmaking(lib)
+        if not matchmaking:
+            raise SteamError("could not get the ISteamMatchmaking interface")
+        return matchmaking
+
+    def _pump(self, lib: ctypes.CDLL) -> list[SteamCallback]:
+        pipe = lib.SteamAPI_GetHSteamPipe()
+        lib.SteamAPI_ManualDispatch_RunFrame(pipe)
+
+        callbacks = []
+        msg = CallbackMsg()
+        while lib.SteamAPI_ManualDispatch_GetNextCallback(pipe, msg):
+            # msg.m_pubParam points into memory Steam releases in
+            # FreeLastCallback, which must be called before fetching the next one.
+            try:
+                callbacks.append(_read_callback(lib, pipe, msg))
+            finally:
+                lib.SteamAPI_ManualDispatch_FreeLastCallback(pipe)
+        return callbacks
 
     def _running_lib(self) -> ctypes.CDLL:
         if self._lib is None:
