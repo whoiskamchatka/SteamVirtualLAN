@@ -32,6 +32,18 @@ ruff format --check .
 
 The tests don't require Steam or the Steamworks SDK.
 
+## Desktop app
+
+With Steam running and the `steamworks` directory set up as described below, start the app from the repository root:
+
+```powershell
+python -m steamlan
+```
+
+Create Lobby starts a network and shows its Lobby ID and access code. Invite Steam Friend opens the Steam overlay, where you pick friends to invite; the invite carries the lobby and access code, and the friend accepts it in Steam while the app is open on their PC. Anyone else can join with Join Lobby, using the Lobby ID and access code. The access code only exists in the host's app, in the invites it sends and with the people it is given to, and the host checks it over the Steam connection; it is never stored in the lobby.
+
+The app connects members to each other but doesn't carry any game traffic yet.
+
 ## Testing with the real Steam API
 
 Steamworks files are not included in this repository. For local development, put them in a `steamworks` directory at the repository root:

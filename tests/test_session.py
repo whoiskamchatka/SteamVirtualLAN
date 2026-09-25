@@ -77,7 +77,7 @@ class FakeSteam:
     def accept_connection(self, connection):
         self.accepted.append(connection)
 
-    def close_connection(self, connection, debug=""):
+    def close_connection(self, connection, debug="", linger=False):
         self.closed.append(connection)
         return True
 

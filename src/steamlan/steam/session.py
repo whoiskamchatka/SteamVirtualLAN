@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from steamlan.steam.client import SteamClient, SteamError
+from steamlan.steam.client import SteamCallback, SteamClient, SteamError
 from steamlan.steam.lobby import LobbyMemberUpdate, decode_lobby_event
 from steamlan.steam.native import ConnectionState
 from steamlan.steam.networking import ConnectionStatusChange, decode_networking_event
@@ -57,7 +57,11 @@ class LobbySession:
 
     def poll(self) -> list[tuple[int, bytes]]:
         """Handle pending callbacks and return (steam_id, data) for received messages."""
-        for callback in self.steam.run_callbacks():
+        return self.process(self.steam.run_callbacks())
+
+    def process(self, callbacks: list[SteamCallback]) -> list[tuple[int, bytes]]:
+        """Like poll(), for callbacks the caller already took from run_callbacks()."""
+        for callback in callbacks:
             lobby_event = decode_lobby_event(callback)
             if isinstance(lobby_event, LobbyMemberUpdate):
                 if lobby_event.lobby_id == self.lobby_id:
@@ -75,6 +79,12 @@ class LobbySession:
         if peer is None or not peer.connected:
             raise SteamError(f"not connected to {steam_id}")
         self.steam.send_message(peer.connection, data)
+
+    def disconnect(self, steam_id: int, reason: str, linger: bool = False) -> None:
+        """Close the connection to a peer and don't connect to it again."""
+        peer = self.peers.get(steam_id)
+        if peer is not None:
+            self._close(peer, reason, linger)
 
     def close(self) -> None:
         for peer in self.peers.values():
@@ -139,9 +149,9 @@ class LobbySession:
                 received += [(peer.steam_id, data) for data in messages]
         return received
 
-    def _close(self, peer: Peer, reason: str) -> None:
+    def _close(self, peer: Peer, reason: str, linger: bool = False) -> None:
         if peer.connection:
-            self.steam.close_connection(peer.connection, reason)
+            self.steam.close_connection(peer.connection, reason, linger)
             self.log(f"Connection to {peer.steam_id} closed: {reason}")
         peer.connection = 0
         peer.connected = False

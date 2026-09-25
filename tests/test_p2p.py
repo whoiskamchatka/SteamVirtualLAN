@@ -337,3 +337,77 @@ def test_receive_more_messages_than_slots(steam, lib):
         steam.receive_messages(CONNECTION, max_messages=2)
 
     assert len(fake.released) == 2
+
+
+UTILS = 0x6000
+FRIENDS = 0x7000
+
+
+@pytest.fixture
+def overlay_lib(lib):
+    lib.SteamAPI_SteamUtils_v011.return_value = UTILS
+    lib.SteamAPI_SteamFriends_v018.return_value = FRIENDS
+    return lib
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_overlay_enabled(steam, overlay_lib, enabled):
+    overlay_lib.SteamAPI_ISteamUtils_IsOverlayEnabled.return_value = enabled
+
+    assert steam.overlay_enabled is enabled
+    overlay_lib.SteamAPI_ISteamUtils_IsOverlayEnabled.assert_called_once_with(UTILS)
+
+
+def test_overlay_needs_present(steam, overlay_lib):
+    overlay_lib.SteamAPI_ISteamUtils_BOverlayNeedsPresent.return_value = True
+
+    assert steam.overlay_needs_present() is True
+    overlay_lib.SteamAPI_ISteamUtils_BOverlayNeedsPresent.assert_called_once_with(UTILS)
+
+
+def test_overlay_without_utils_interface(steam, overlay_lib):
+    overlay_lib.SteamAPI_SteamUtils_v011.return_value = None
+
+    with pytest.raises(SteamError, match="ISteamUtils"):
+        _ = steam.overlay_enabled
+    with pytest.raises(SteamError, match="ISteamUtils"):
+        steam.overlay_needs_present()
+
+
+def test_open_invite_dialog(steam, overlay_lib):
+    steam.open_invite_dialog("steamvirtuallan:1:123:ABCDEFGHJK")
+
+    invite = overlay_lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString
+    invite.assert_called_once_with(FRIENDS, b"steamvirtuallan:1:123:ABCDEFGHJK")
+
+
+def test_open_invite_dialog_longest_connect_string(steam, overlay_lib):
+    steam.open_invite_dialog("x" * 255)
+
+
+@pytest.mark.parametrize("connect", ["", "x" * 256, "a\0b"])
+def test_open_invite_dialog_rejects_bad_connect_string(steam, overlay_lib, connect):
+    with pytest.raises(ValueError, match="1 to 255 bytes"):
+        steam.open_invite_dialog(connect)
+
+    overlay_lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString.assert_not_called()
+
+
+def test_open_invite_dialog_without_friends_interface(steam, overlay_lib):
+    overlay_lib.SteamAPI_SteamFriends_v018.return_value = None
+
+    with pytest.raises(SteamError, match="ISteamFriends"):
+        steam.open_invite_dialog("steamvirtuallan:1:123:ABCDEFGHJK")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda steam: steam.overlay_enabled,
+        lambda steam: steam.overlay_needs_present(),
+        lambda steam: steam.open_invite_dialog("steamvirtuallan:1:123:ABCDEFGHJK"),
+    ],
+)
+def test_overlay_calls_need_running_steam(load, lib, operation):
+    with pytest.raises(SteamError, match="not running"):
+        operation(SteamClient("steam_api64.dll"))

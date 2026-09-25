@@ -2,6 +2,7 @@ import pytest
 
 from steamlan.steam import (
     ChatMemberStateChange,
+    ConnectStringJoinRequest,
     LobbyJoinRequest,
     LobbyMemberUpdate,
     SteamCallback,
@@ -10,8 +11,10 @@ from steamlan.steam import (
 )
 from steamlan.steam.native import (
     GAME_LOBBY_JOIN_REQUESTED,
+    GAME_RICH_PRESENCE_JOIN_REQUESTED,
     LOBBY_CHAT_UPDATE,
     GameLobbyJoinRequested,
+    GameRichPresenceJoinRequested,
     LobbyChatUpdate,
 )
 
@@ -112,3 +115,28 @@ def test_call_result_is_not_decoded_as_event():
     )
 
     assert decode_lobby_event(callback) is callback
+
+
+def connect_string_join(connect, friend_id=HOST_ID):
+    payload = bytes(GameRichPresenceJoinRequested(friend_id, connect))
+    return SteamCallback(GAME_RICH_PRESENCE_JOIN_REQUESTED, payload)
+
+
+def test_connect_string_join_request():
+    event = decode_lobby_event(connect_string_join(b"steamvirtuallan:1:123:ABCDEFGHJK"))
+
+    assert event == ConnectStringJoinRequest("steamvirtuallan:1:123:ABCDEFGHJK", HOST_ID)
+
+
+def test_connect_string_join_request_full_buffer():
+    event = decode_lobby_event(connect_string_join(b"x" * 256, friend_id=0))
+
+    assert event.connect == "x" * 256
+    assert event.friend_id is None
+
+
+def test_connect_string_join_request_wrong_size():
+    callback = SteamCallback(GAME_RICH_PRESENCE_JOIN_REQUESTED, b"\x00" * 263)
+
+    with pytest.raises(SteamError, match="bytes, expected 264"):
+        decode_lobby_event(callback)

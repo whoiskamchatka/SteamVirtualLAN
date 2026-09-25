@@ -5,7 +5,12 @@ from steamlan.steam.loader import (
     SteamAPINotFoundError,
     load_steam_api,
 )
-from steamlan.steam.lobby import LobbyJoinRequest, LobbyMemberUpdate, decode_lobby_event
+from steamlan.steam.lobby import (
+    ConnectStringJoinRequest,
+    LobbyJoinRequest,
+    LobbyMemberUpdate,
+    decode_lobby_event,
+)
 from steamlan.steam.native import ChatMemberStateChange, ConnectionState, LobbyType
 from steamlan.steam.networking import ConnectionStatusChange, decode_networking_event
 from steamlan.steam.session import LobbySession, Peer, initiates
@@ -13,6 +18,7 @@ from steamlan.steam.session import LobbySession, Peer, initiates
 __all__ = [
     "STEAM_API_DLL",
     "ChatMemberStateChange",
+    "ConnectStringJoinRequest",
     "ConnectionState",
     "ConnectionStatusChange",
     "LobbyJoinRequest",

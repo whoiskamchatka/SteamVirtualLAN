@@ -135,6 +135,18 @@ class GameLobbyJoinRequested(ctypes.Structure):
 GAME_LOBBY_JOIN_REQUESTED = 333  # GameLobbyJoinRequested_t::k_iCallback
 
 
+# The friend is a CSteamID (see GameLobbyJoinRequested), followed by a
+# char[k_cchMaxRichPresenceValueLength] connect string.
+class GameRichPresenceJoinRequested(ctypes.Structure):
+    _fields_ = [
+        ("m_steamIDFriend", ctypes.c_uint64),
+        ("m_rgchConnect", ctypes.c_char * 256),
+    ]
+
+
+GAME_RICH_PRESENCE_JOIN_REQUESTED = 337  # GameRichPresenceJoinRequested_t::k_iCallback
+
+
 HSteamNetConnection = ctypes.c_uint32
 HSteamListenSocket = ctypes.c_uint32
 SteamNetworkingPOPID = ctypes.c_uint32
@@ -331,6 +343,46 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         lib.SteamAPI_ISteamMatchmaking_JoinLobby.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         lib.SteamAPI_ISteamMatchmaking_JoinLobby.restype = SteamAPICall_t
 
+        lib.SteamAPI_ISteamMatchmaking_SetLobbyData.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ]
+        lib.SteamAPI_ISteamMatchmaking_SetLobbyData.restype = ctypes.c_bool
+
+        # Steam owns the returned strings; c_char_p copies them on return.
+        lib.SteamAPI_ISteamMatchmaking_GetLobbyData.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_char_p,
+        ]
+        lib.SteamAPI_ISteamMatchmaking_GetLobbyData.restype = ctypes.c_char_p
+
+        lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.restype = ctypes.c_uint64
+
+        lib.SteamAPI_ISteamFriends_GetFriendPersonaName.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        lib.SteamAPI_ISteamFriends_GetFriendPersonaName.restype = ctypes.c_char_p
+
+        lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+        ]
+        lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString.restype = None
+
+        lib.SteamAPI_SteamUtils_v011.argtypes = []
+        lib.SteamAPI_SteamUtils_v011.restype = ctypes.c_void_p
+
+        lib.SteamAPI_ISteamUtils_IsOverlayEnabled.argtypes = [ctypes.c_void_p]
+        lib.SteamAPI_ISteamUtils_IsOverlayEnabled.restype = ctypes.c_bool
+
+        lib.SteamAPI_ISteamUtils_BOverlayNeedsPresent.argtypes = [ctypes.c_void_p]
+        lib.SteamAPI_ISteamUtils_BOverlayNeedsPresent.restype = ctypes.c_bool
+
         lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.argtypes = []
         lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.restype = ctypes.c_void_p
 
@@ -415,8 +467,9 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
 
 
 # Same as the header's inline SteamAPI_SteamUser(), SteamAPI_SteamFriends(),
-# SteamAPI_SteamMatchmaking() and SteamAPI_SteamNetworkingSockets_SteamAPI():
-# the exported accessors are versioned, so the versions live only here.
+# SteamAPI_SteamMatchmaking(), SteamAPI_SteamUtils() and
+# SteamAPI_SteamNetworkingSockets_SteamAPI(): the exported accessors are
+# versioned, so the versions live only here.
 def steam_user(lib: ctypes.CDLL) -> int | None:
     return lib.SteamAPI_SteamUser_v023()
 
@@ -427,6 +480,10 @@ def steam_friends(lib: ctypes.CDLL) -> int | None:
 
 def steam_matchmaking(lib: ctypes.CDLL) -> int | None:
     return lib.SteamAPI_SteamMatchmaking_v009()
+
+
+def steam_utils(lib: ctypes.CDLL) -> int | None:
+    return lib.SteamAPI_SteamUtils_v011()
 
 
 def steam_networking_sockets(lib: ctypes.CDLL) -> int | None:

@@ -29,6 +29,7 @@ from steamlan.steam.native import (
     steam_matchmaking,
     steam_networking_sockets,
     steam_user,
+    steam_utils,
 )
 
 _CALL_POLL_INTERVAL = 0.01
@@ -102,7 +103,8 @@ def _result_name(result: int) -> str:
         return f"result {result}"
 
 
-def _read_lobby_created(callback: SteamCallback) -> int:
+def read_lobby_created(callback: SteamCallback) -> int:
+    """Lobby ID from the result of request_create_lobby(); raises SteamError on failure."""
     if callback.failed:
         raise SteamError("CreateLobby failed: Steam could not deliver the result")
     if callback.callback_id != LOBBY_CREATED:
@@ -118,7 +120,8 @@ def _read_lobby_created(callback: SteamCallback) -> int:
     return created.m_ulSteamIDLobby
 
 
-def _read_lobby_enter(callback: SteamCallback, lobby_id: int) -> int:
+def read_lobby_enter(callback: SteamCallback, lobby_id: int) -> int:
+    """Lobby ID from the result of request_join_lobby(); raises SteamError on failure."""
     if callback.failed:
         raise SteamError("JoinLobby failed: Steam could not deliver the result")
     if callback.callback_id != LOBBY_ENTER:
@@ -214,11 +217,7 @@ class SteamClient:
     @property
     def persona_name(self) -> str:
         lib = self._running_lib()
-        friends = steam_friends(lib)
-        if not friends:
-            raise SteamError("could not get the ISteamFriends interface")
-
-        name = lib.SteamAPI_ISteamFriends_GetPersonaName(friends)
+        name = lib.SteamAPI_ISteamFriends_GetPersonaName(self._friends(lib))
         if name is None:
             raise SteamError("Steam returned no persona name")
         return name.decode("utf-8", errors="replace")
@@ -248,23 +247,63 @@ class SteamClient:
         lobby_type: LobbyType = LobbyType.FRIENDS_ONLY,
         timeout: float = 10.0,
     ) -> int:
+        api_call = self.request_create_lobby(max_members, lobby_type)
+        return read_lobby_created(self._wait_for_call(api_call, timeout))
+
+    def request_create_lobby(
+        self, max_members: int, lobby_type: LobbyType = LobbyType.FRIENDS_ONLY
+    ) -> int:
+        """Start CreateLobby without waiting; the result arrives from run_callbacks()."""
         lib = self._running_lib()
         api_call = lib.SteamAPI_ISteamMatchmaking_CreateLobby(
             self._matchmaking(lib), lobby_type, max_members
         )
         if api_call == API_CALL_INVALID:
             raise SteamError("CreateLobby could not be started")
-
-        return _read_lobby_created(self._wait_for_call(api_call, timeout))
+        return api_call
 
     def join_lobby(self, lobby_id: int, timeout: float = 10.0) -> int:
+        api_call = self.request_join_lobby(lobby_id)
+        return read_lobby_enter(self._wait_for_call(api_call, timeout), lobby_id)
+
+    def request_join_lobby(self, lobby_id: int) -> int:
+        """Start JoinLobby without waiting; the result arrives from run_callbacks()."""
         lib = self._running_lib()
         _check_steam_id(lobby_id, "lobby ID")
         api_call = lib.SteamAPI_ISteamMatchmaking_JoinLobby(self._matchmaking(lib), lobby_id)
         if api_call == API_CALL_INVALID:
             raise SteamError("JoinLobby could not be started")
+        return api_call
 
-        return _read_lobby_enter(self._wait_for_call(api_call, timeout), lobby_id)
+    def lobby_owner(self, lobby_id: int) -> int:
+        lib = self._running_lib()
+        owner = lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner(self._matchmaking(lib), lobby_id)
+        if not owner:
+            raise SteamError("Steam returned no lobby owner")
+        return owner
+
+    def set_lobby_data(self, lobby_id: int, key: str, value: str) -> None:
+        """Set lobby metadata. Anyone who knows the lobby ID can read it."""
+        lib = self._running_lib()
+        if not lib.SteamAPI_ISteamMatchmaking_SetLobbyData(
+            self._matchmaking(lib), lobby_id, key.encode(), value.encode()
+        ):
+            raise SteamError(f"SetLobbyData failed for {key!r}")
+
+    def lobby_data(self, lobby_id: int, key: str) -> str:
+        """Lobby metadata value, or "" when it is not set."""
+        lib = self._running_lib()
+        value = lib.SteamAPI_ISteamMatchmaking_GetLobbyData(
+            self._matchmaking(lib), lobby_id, key.encode()
+        )
+        return (value or b"").decode("utf-8", errors="replace")
+
+    def friend_persona_name(self, steam_id: int) -> str:
+        """Name of another user, or "" while Steam does not know it yet."""
+        lib = self._running_lib()
+        name = lib.SteamAPI_ISteamFriends_GetFriendPersonaName(self._friends(lib), steam_id)
+        name = (name or b"").decode("utf-8", errors="replace")
+        return "" if name == "[unknown]" else name
 
     def leave_lobby(self, lobby_id: int) -> None:
         lib = self._running_lib()
@@ -332,16 +371,17 @@ class SteamClient:
         )
         _check_result(result, "AcceptConnection")
 
-    def close_connection(self, connection: int, debug: str = "") -> bool:
+    def close_connection(self, connection: int, debug: str = "", linger: bool = False) -> bool:
         """Close a connection; returns False if Steam no longer knew the handle.
 
         Also required after the peer closed it or it failed, to free the handle.
         """
         lib = self._running_lib()
         # Reason 0 is k_ESteamNetConnectionEnd_App_Generic. Without linger,
-        # reliable data that has not been sent yet is dropped.
+        # reliable data that has not been sent yet is dropped; with it, Steam
+        # keeps sending from this process for a while after the call.
         return lib.SteamAPI_ISteamNetworkingSockets_CloseConnection(
-            self._sockets(lib), connection, 0, debug.encode(), False
+            self._sockets(lib), connection, 0, debug.encode(), linger
         )
 
     def send_message(self, connection: int, data: bytes) -> None:
@@ -389,6 +429,48 @@ class SteamClient:
             if time.monotonic() >= deadline:
                 raise SteamError(f"timed out after {timeout:g}s waiting for Steam API call")
             time.sleep(_CALL_POLL_INTERVAL)
+
+    @property
+    def overlay_enabled(self) -> bool:
+        """Whether the Steam overlay has hooked this process and can be shown.
+
+        Steam needs a few seconds after start to hook a window, and can only hook
+        one presented with Direct3D, OpenGL or Vulkan.
+        """
+        lib = self._running_lib()
+        return lib.SteamAPI_ISteamUtils_IsOverlayEnabled(self._utils(lib))
+
+    def overlay_needs_present(self) -> bool:
+        """Whether the overlay is waiting for the window to present a new frame."""
+        lib = self._running_lib()
+        return lib.SteamAPI_ISteamUtils_BOverlayNeedsPresent(self._utils(lib))
+
+    def open_invite_dialog(self, connect_string: str) -> None:
+        """Open the Steam overlay's invite dialog; invites carry connect_string.
+
+        The chosen friends' copy of the app receives it as a rich presence join
+        request when they accept.
+        """
+        data = connect_string.encode()
+        # It must fit a char[k_cchMaxRichPresenceValueLength] with its terminator.
+        if not data or len(data) >= 256 or b"\0" in data:
+            raise ValueError("invite connect string must be 1 to 255 bytes without NUL")
+        lib = self._running_lib()
+        lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString(
+            self._friends(lib), data
+        )
+
+    def _utils(self, lib: ctypes.CDLL) -> int:
+        utils = steam_utils(lib)
+        if not utils:
+            raise SteamError("could not get the ISteamUtils interface")
+        return utils
+
+    def _friends(self, lib: ctypes.CDLL) -> int:
+        friends = steam_friends(lib)
+        if not friends:
+            raise SteamError("could not get the ISteamFriends interface")
+        return friends
 
     def _sockets(self, lib: ctypes.CDLL) -> int:
         sockets = steam_networking_sockets(lib)

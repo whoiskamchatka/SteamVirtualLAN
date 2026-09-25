@@ -7,6 +7,7 @@ from steamlan.steam import SteamAPILoadError
 from steamlan.steam.native import (
     CONNECTION_STATUS_CHANGED,
     GAME_LOBBY_JOIN_REQUESTED,
+    GAME_RICH_PRESENCE_JOIN_REQUESTED,
     LOBBY_CHAT_UPDATE,
     LOBBY_CREATED,
     LOBBY_ENTER,
@@ -18,6 +19,7 @@ from steamlan.steam.native import (
     ConnectionState,
     EResult,
     GameLobbyJoinRequested,
+    GameRichPresenceJoinRequested,
     HSteamPipe,
     LobbyChatUpdate,
     LobbyCreated,
@@ -365,3 +367,25 @@ def test_missing_export():
 
     with pytest.raises(SteamAPILoadError, match="unsupported"):
         bind(lib)
+
+
+def test_overlay_signatures():
+    lib = bind(mock.Mock())
+
+    invite = lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString
+    assert invite.argtypes == [ctypes.c_void_p, ctypes.c_char_p]
+    assert invite.restype is None
+    assert lib.SteamAPI_SteamUtils_v011.argtypes == []
+    assert lib.SteamAPI_SteamUtils_v011.restype is ctypes.c_void_p
+    for name in (
+        "SteamAPI_ISteamUtils_IsOverlayEnabled",
+        "SteamAPI_ISteamUtils_BOverlayNeedsPresent",
+    ):
+        assert getattr(lib, name).argtypes == [ctypes.c_void_p]
+        assert getattr(lib, name).restype is ctypes.c_bool
+
+
+def test_game_rich_presence_join_requested_layout():
+    assert GAME_RICH_PRESENCE_JOIN_REQUESTED == 300 + 37
+    assert ctypes.sizeof(GameRichPresenceJoinRequested) == 8 + 256
+    assert offsets(GameRichPresenceJoinRequested) == [0, 8]

@@ -65,7 +65,7 @@ class FakeSteam:
     def receive_messages(self, connection):
         return [self.inbox.pop(0)] if self.inbox else []
 
-    def close_connection(self, connection, debug=""):
+    def close_connection(self, connection, debug="", linger=False):
         self.closed.append(connection)
         return True
 
@@ -387,7 +387,7 @@ class LinkedSteam:
     def receive_messages(self, connection):
         return self.inbox.pop(connection, [])
 
-    def close_connection(self, connection, debug=""):
+    def close_connection(self, connection, debug="", linger=False):
         return True
 
 

@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from steamlan.steam.client import SteamCallback, SteamError
 from steamlan.steam.native import (
     GAME_LOBBY_JOIN_REQUESTED,
+    GAME_RICH_PRESENCE_JOIN_REQUESTED,
     LOBBY_CHAT_UPDATE,
     ChatMemberStateChange,
     GameLobbyJoinRequested,
+    GameRichPresenceJoinRequested,
     LobbyChatUpdate,
 )
 
@@ -14,6 +16,15 @@ from steamlan.steam.native import (
 @dataclass(frozen=True)
 class LobbyJoinRequest:
     lobby_id: int
+    # None when the join did not come directly through a friend.
+    friend_id: int | None
+
+
+@dataclass(frozen=True)
+class ConnectStringJoinRequest:
+    """The user accepted an invite sent with a connect string."""
+
+    connect: str
     # None when the join did not come directly through a friend.
     friend_id: int | None
 
@@ -37,7 +48,7 @@ def _decode(callback: SteamCallback, struct: type) -> ctypes.Structure:
 
 def decode_lobby_event(
     callback: SteamCallback,
-) -> LobbyJoinRequest | LobbyMemberUpdate | SteamCallback:
+) -> LobbyJoinRequest | ConnectStringJoinRequest | LobbyMemberUpdate | SteamCallback:
     """Decode the lobby callbacks SteamLAN uses; anything else is returned unchanged."""
     if callback.api_call:
         return callback
@@ -47,6 +58,11 @@ def decode_lobby_event(
         if not request.m_steamIDLobby:
             raise SteamError("lobby join request without a lobby ID")
         return LobbyJoinRequest(request.m_steamIDLobby, request.m_steamIDFriend or None)
+
+    if callback.callback_id == GAME_RICH_PRESENCE_JOIN_REQUESTED:
+        request = _decode(callback, GameRichPresenceJoinRequested)
+        connect = request.m_rgchConnect.decode("utf-8", errors="replace")
+        return ConnectStringJoinRequest(connect, request.m_steamIDFriend or None)
 
     if callback.callback_id == LOBBY_CHAT_UPDATE:
         update = _decode(callback, LobbyChatUpdate)

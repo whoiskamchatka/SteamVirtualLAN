@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Create a virtual LAN with your Steam friends."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "PySide6>=6.8",
+]
 
 [dependency-groups]
 dev = [
