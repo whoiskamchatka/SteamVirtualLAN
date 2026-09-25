@@ -2,15 +2,19 @@ import ctypes
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from steamlan.steam.loader import load_steam_api
 from steamlan.steam.native import (
     API_CALL_INVALID,
     LOBBY_CREATED,
+    LOBBY_ENTER,
     STEAM_API_CALL_COMPLETED,
     CallbackMsg,
+    ChatRoomEnterResponse,
     EResult,
     LobbyCreated,
+    LobbyEnter,
     LobbyType,
     SteamAPICallCompleted,
     SteamAPIInitResult,
@@ -92,20 +96,42 @@ def _result_name(result: int) -> str:
         return f"result {result}"
 
 
-def _read_lobby_created(callback: SteamCallback) -> int:
+def _call_result(callback: SteamCallback, call: str, callback_id: int, struct: type) -> Any:
     if callback.failed:
-        raise SteamError("CreateLobby failed: Steam could not deliver the result")
-    if callback.callback_id != LOBBY_CREATED:
-        raise SteamError(f"CreateLobby returned unexpected callback {callback.callback_id}")
-    if len(callback.payload) != ctypes.sizeof(LobbyCreated):
-        raise SteamError(f"CreateLobby returned {len(callback.payload)} bytes for LobbyCreated_t")
+        raise SteamError(f"{call} failed: Steam could not deliver the result")
+    if callback.callback_id != callback_id:
+        raise SteamError(f"{call} returned unexpected callback {callback.callback_id}")
+    if len(callback.payload) != ctypes.sizeof(struct):
+        raise SteamError(f"{call} returned {len(callback.payload)} bytes for {struct.__name__}_t")
+    return struct.from_buffer_copy(callback.payload)
 
-    created = LobbyCreated.from_buffer_copy(callback.payload)
+
+def _read_lobby_created(callback: SteamCallback) -> int:
+    created = _call_result(callback, "CreateLobby", LOBBY_CREATED, LobbyCreated)
     if created.m_eResult != EResult.OK:
         raise SteamError(f"CreateLobby failed: {_result_name(created.m_eResult)}")
     if not created.m_ulSteamIDLobby:
         raise SteamError("CreateLobby succeeded but returned no lobby ID")
     return created.m_ulSteamIDLobby
+
+
+def _read_lobby_enter(callback: SteamCallback, lobby_id: int) -> int:
+    entered = _call_result(callback, "JoinLobby", LOBBY_ENTER, LobbyEnter)
+    response = entered.m_EChatRoomEnterResponse
+    if response != ChatRoomEnterResponse.SUCCESS:
+        try:
+            reason = ChatRoomEnterResponse(response).name
+        except ValueError:
+            reason = f"response {response}"
+        raise SteamError(f"JoinLobby failed: {reason}")
+    if entered.m_ulSteamIDLobby != lobby_id:
+        raise SteamError("JoinLobby entered a different lobby than requested")
+    return entered.m_ulSteamIDLobby
+
+
+def _check_steam_id(steam_id: int, what: str) -> None:
+    if not steam_id:
+        raise ValueError(f"invalid {what}: {steam_id}")
 
 
 class SteamClient:
@@ -161,11 +187,7 @@ class SteamClient:
     @property
     def persona_name(self) -> str:
         lib = self._running_lib()
-        friends = steam_friends(lib)
-        if not friends:
-            raise SteamError("could not get the ISteamFriends interface")
-
-        name = lib.SteamAPI_ISteamFriends_GetPersonaName(friends)
+        name = lib.SteamAPI_ISteamFriends_GetPersonaName(self._friends(lib))
         if name is None:
             raise SteamError("Steam returned no persona name")
         return name.decode("utf-8", errors="replace")
@@ -190,9 +212,34 @@ class SteamClient:
 
         return _read_lobby_created(self._wait_for_call(api_call, timeout))
 
+    def join_lobby(self, lobby_id: int, timeout: float = 10.0) -> int:
+        lib = self._running_lib()
+        _check_steam_id(lobby_id, "lobby ID")
+        api_call = lib.SteamAPI_ISteamMatchmaking_JoinLobby(self._matchmaking(lib), lobby_id)
+        if api_call == API_CALL_INVALID:
+            raise SteamError("JoinLobby could not be started")
+
+        return _read_lobby_enter(self._wait_for_call(api_call, timeout), lobby_id)
+
     def leave_lobby(self, lobby_id: int) -> None:
         lib = self._running_lib()
         lib.SteamAPI_ISteamMatchmaking_LeaveLobby(self._matchmaking(lib), lobby_id)
+
+    def open_lobby_invite(self, lobby_id: int) -> None:
+        # Only asks Steam to show the overlay; Steam does not report whether it
+        # appeared, and it never does in a process the overlay has not hooked.
+        lib = self._running_lib()
+        _check_steam_id(lobby_id, "lobby ID")
+        lib.SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog(self._friends(lib), lobby_id)
+
+    def invite_to_lobby(self, lobby_id: int, friend_id: int) -> None:
+        lib = self._running_lib()
+        _check_steam_id(lobby_id, "lobby ID")
+        _check_steam_id(friend_id, "friend SteamID")
+        if not lib.SteamAPI_ISteamMatchmaking_InviteUserToLobby(
+            self._matchmaking(lib), lobby_id, friend_id
+        ):
+            raise SteamError("InviteUserToLobby failed; Steam may not be connected")
 
     def lobby_member_count(self, lobby_id: int) -> int:
         lib = self._running_lib()
@@ -227,6 +274,12 @@ class SteamClient:
             if time.monotonic() >= deadline:
                 raise SteamError(f"timed out after {timeout:g}s waiting for Steam API call")
             time.sleep(_CALL_POLL_INTERVAL)
+
+    def _friends(self, lib: ctypes.CDLL) -> int:
+        friends = steam_friends(lib)
+        if not friends:
+            raise SteamError("could not get the ISteamFriends interface")
+        return friends
 
     def _matchmaking(self, lib: ctypes.CDLL) -> int:
         matchmaking = steam_matchmaking(lib)
