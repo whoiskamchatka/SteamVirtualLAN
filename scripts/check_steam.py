@@ -1,4 +1,4 @@
-"""Initialize and shut down the real Steam API to check that the binding works.
+"""Initialize the real Steam API, print the current user and shut it down again.
 
 Uses steamworks/steam_api64.dll and steamworks/steam_appid.txt from the
 repository root unless a DLL path is given.
@@ -8,7 +8,13 @@ import os
 import sys
 from pathlib import Path
 
-from steamlan.steam import STEAM_API_DLL, SteamAPILoadError, SteamClient, SteamInitError
+from steamlan.steam import (
+    STEAM_API_DLL,
+    SteamAPILoadError,
+    SteamClient,
+    SteamError,
+    SteamInitError,
+)
 
 STEAMWORKS_DIR = Path(__file__).resolve().parent.parent / "steamworks"
 APP_ID_FILE = STEAMWORKS_DIR / "steam_appid.txt"
@@ -45,9 +51,11 @@ def main() -> int:
     os.environ["SteamAppId"] = read_app_id()
 
     try:
-        with SteamClient(dll_path):
+        with SteamClient(dll_path) as steam:
             print("Steam API initialized")
-    except (SteamAPILoadError, SteamInitError) as exc:
+            print(f"Steam user: {steam.persona_name}")
+            print(f"Steam ID: {steam.steam_id}")
+    except (SteamAPILoadError, SteamInitError, SteamError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

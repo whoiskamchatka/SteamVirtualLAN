@@ -1,4 +1,4 @@
-from steamlan.steam.client import SteamClient, SteamInitError
+from steamlan.steam.client import SteamClient, SteamError, SteamInitError
 from steamlan.steam.loader import (
     STEAM_API_DLL,
     SteamAPILoadError,
@@ -11,6 +11,7 @@ __all__ = [
     "SteamAPILoadError",
     "SteamAPINotFoundError",
     "SteamClient",
+    "SteamError",
     "SteamInitError",
     "load_steam_api",
 ]

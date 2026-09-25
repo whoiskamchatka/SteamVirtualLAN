@@ -2,10 +2,20 @@ import ctypes
 import os
 
 from steamlan.steam.loader import load_steam_api
-from steamlan.steam.native import SteamAPIInitResult, SteamErrMsg, bind
+from steamlan.steam.native import (
+    SteamAPIInitResult,
+    SteamErrMsg,
+    bind,
+    steam_friends,
+    steam_user,
+)
 
 
 class SteamInitError(Exception):
+    pass
+
+
+class SteamError(Exception):
     pass
 
 
@@ -48,6 +58,35 @@ class SteamClient:
 
         lib, self._lib = self._lib, None
         lib.SteamAPI_Shutdown()
+
+    @property
+    def steam_id(self) -> int:
+        lib = self._running_lib()
+        user = steam_user(lib)
+        if not user:
+            raise SteamError("could not get the ISteamUser interface")
+
+        steam_id = lib.SteamAPI_ISteamUser_GetSteamID(user)
+        if not steam_id:
+            raise SteamError("Steam returned an empty SteamID")
+        return steam_id
+
+    @property
+    def persona_name(self) -> str:
+        lib = self._running_lib()
+        friends = steam_friends(lib)
+        if not friends:
+            raise SteamError("could not get the ISteamFriends interface")
+
+        name = lib.SteamAPI_ISteamFriends_GetPersonaName(friends)
+        if name is None:
+            raise SteamError("Steam returned no persona name")
+        return name.decode("utf-8", errors="replace")
+
+    def _running_lib(self) -> ctypes.CDLL:
+        if self._lib is None:
+            raise SteamError("Steam API is not running; call start() first")
+        return self._lib
 
     def __enter__(self) -> "SteamClient":
         self.start()
