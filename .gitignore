@@ -17,7 +17,8 @@ env/
 .coverage
 htmlcov/
 
-# Local Steamworks files and Valve SDK/redistributables (never commit these)
+# Valve's Steamworks SDK and redistributables stay local; never commit them.
+# steam_appid.txt is ours (written by SteamVirtualLAN) and is not ignored.
 /steamworks/
 sdk/
 steamworks_sdk*/
@@ -25,6 +26,12 @@ steamworks_sdk*.zip
 steam_api*.lib
 libsteam_api.so
 libsteam_api.dylib
+
+# Wintun (wintun.dll from wintun.net) stays local too.
+/wintun/
+wintun*.zip
+
+# No third-party binaries in the repository, wherever they end up.
 *.dll
 
 # Editors and OS

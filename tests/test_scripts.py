@@ -1,4 +1,5 @@
 import importlib
+import ipaddress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ def scripts(monkeypatch):
         host=importlib.import_module("p2p_host"),
         guest=importlib.import_module("p2p_guest"),
         lobby=importlib.import_module("lobby_p2p"),
+        adapter=importlib.import_module("check_adapter"),
     )
     monkeypatch.setattr(modules.host, "POLL_INTERVAL", 0)
     monkeypatch.setattr(modules.guest, "POLL_INTERVAL", 0)
@@ -408,3 +410,113 @@ def test_two_members_connect_and_exchange_hello(scripts, first, second):
     assert network.connects == [min(first, second)]
     assert f"P2P test succeeded with {second}" in logs[first]
     assert f"P2P test succeeded with {first}" in logs[second]
+
+
+def ping(source="10.77.0.1", destination="10.77.0.2", icmp_type=8, protocol=1):
+    icmp = bytes([icmp_type, 0, 0, 0]) + (1).to_bytes(2, "big") + (7).to_bytes(2, "big") + b"abcd"
+    header = bytearray(20)
+    header[0] = 0x45
+    header[2:4] = (20 + len(icmp)).to_bytes(2, "big")
+    header[4:6] = (0x1234).to_bytes(2, "big")
+    header[8] = 128
+    header[9] = protocol
+    header[12:16] = ipaddress.IPv4Address(source).packed
+    header[16:20] = ipaddress.IPv4Address(destination).packed
+    return bytes(header) + icmp
+
+
+def test_internet_checksum(scripts):
+    # RFC 1071 example words.
+    data = bytes.fromhex("0001f203f4f5f6f7")
+    total = scripts.adapter.checksum(data)
+
+    assert total == 0x220D
+    assert scripts.adapter.checksum(data + total.to_bytes(2, "big")) == 0
+
+
+def test_echo_reply(scripts):
+    request = ping()
+
+    reply = scripts.adapter.echo_reply(request)
+
+    assert reply[12:16] == request[16:20]
+    assert reply[16:20] == request[12:16]
+    assert reply[20] == 0
+    assert reply[24:] == request[24:]
+    assert reply[4:6] == request[4:6]
+    assert scripts.adapter.checksum(reply[:20]) == 0
+    assert scripts.adapter.checksum(reply[20:]) == 0
+    assert len(reply) == int.from_bytes(reply[2:4], "big")
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        ping(destination="10.77.1.2"),
+        ping(destination="10.77.0.1"),
+        ping(destination="10.77.0.255"),
+        ping(source="10.77.0.9"),
+        ping(icmp_type=0),
+        ping(protocol=17),
+        ping()[:24],
+        b"\x60" + b"\0" * 39,
+        b"",
+    ],
+    ids=[
+        "other-subnet",
+        "own-address",
+        "broadcast",
+        "not-from-this-machine",
+        "already-a-reply",
+        "udp",
+        "truncated",
+        "ipv6",
+        "empty",
+    ],
+)
+def test_no_echo_reply(scripts, packet):
+    assert scripts.adapter.echo_reply(packet) is None
+
+
+def test_elevation_relaunches_with_the_same_options(scripts, monkeypatch):
+    launched = []
+    monkeypatch.setattr(
+        scripts.adapter, "relaunch_as_admin", lambda args: launched.append(args) or True
+    )
+
+    assert scripts.adapter.elevate(["--reply"]) == 0
+    assert launched[0][1:] == ["--reply", "--pause"]
+
+
+def test_elevation_refused(scripts, monkeypatch):
+    monkeypatch.setattr(scripts.adapter, "relaunch_as_admin", lambda args: False)
+
+    assert scripts.adapter.elevate([]) == 1
+
+
+def test_diagnostic_stops_before_elevating_when_wintun_is_unavailable(scripts, monkeypatch):
+    def unavailable():
+        raise scripts.adapter.WintunLoadError("could not download")
+
+    monkeypatch.setattr(scripts.adapter, "ensure_wintun", unavailable)
+    monkeypatch.setattr(scripts.adapter, "relaunch_as_admin", lambda args: pytest.fail("elevated"))
+    monkeypatch.setattr(scripts.adapter.sys, "argv", ["check_adapter.py", "--reply"])
+
+    assert scripts.adapter.main() == 1
+
+
+def test_diagnostic_elevates_after_preparing_wintun(scripts, monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        scripts.adapter, "ensure_wintun", lambda: calls.append("wintun") or tmp_path
+    )
+    monkeypatch.setattr(scripts.adapter, "is_admin", lambda: False)
+    monkeypatch.setattr(
+        scripts.adapter,
+        "relaunch_as_admin",
+        lambda args: calls.append(("elevate", args[1:])) or True,
+    )
+    monkeypatch.setattr(scripts.adapter.sys, "argv", ["check_adapter.py", "--reply"])
+
+    assert scripts.adapter.main() == 0
+    assert calls == ["wintun", ("elevate", ["--reply", "--pause"])]
