@@ -15,9 +15,12 @@ from steamlan.steam.native import (
     SteamAPICallCompleted,
     SteamAPIInitResult,
     SteamErrMsg,
+    SteamNetworkingIdentity,
     bind,
+    identity_steam_id,
     steam_friends,
     steam_matchmaking,
+    steam_networking_sockets,
     steam_user,
 )
 
@@ -174,6 +177,24 @@ class SteamClient:
         if name is None:
             raise SteamError("Steam returned no persona name")
         return name.decode("utf-8", errors="replace")
+
+    @property
+    def networking_steam_id(self) -> int:
+        """SteamID of the local SteamNetworkingSockets identity."""
+        lib = self._running_lib()
+        sockets = steam_networking_sockets(lib)
+        if not sockets:
+            raise SteamError("could not get the ISteamNetworkingSockets interface")
+
+        identity = SteamNetworkingIdentity()
+        if not lib.SteamAPI_ISteamNetworkingSockets_GetIdentity(sockets, identity):
+            raise SteamError("Steam networking identity is not known yet")
+        steam_id = identity_steam_id(identity)
+        if not steam_id:
+            raise SteamError(
+                f"Steam networking identity is not a SteamID (type {identity.m_eType})"
+            )
+        return steam_id
 
     def run_callbacks(self) -> list[SteamCallback]:
         callbacks = self._pump(self._running_lib())

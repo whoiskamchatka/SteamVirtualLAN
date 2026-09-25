@@ -5,17 +5,24 @@ import pytest
 
 from steamlan.steam import SteamAPILoadError
 from steamlan.steam.native import (
+    CONNECTION_STATUS_CHANGED,
     LOBBY_CHAT_UPDATE,
     LOBBY_CREATED,
     CallbackMsg,
     ChatMemberStateChange,
+    ConnectionState,
     HSteamPipe,
     LobbyChatUpdate,
     LobbyCreated,
     LobbyType,
     SteamAPICallCompleted,
     SteamErrMsg,
+    SteamNetConnectionInfo,
+    SteamNetConnectionStatusChangedCallback,
+    SteamNetworkingIdentity,
+    SteamNetworkingIPAddr,
     bind,
+    identity_steam_id,
 )
 
 
@@ -159,6 +166,84 @@ def test_chat_member_state_change_values():
         ("KICKED", 0x08),
         ("BANNED", 0x10),
     ]
+
+
+def test_networking_signatures():
+    lib = bind(mock.Mock())
+
+    assert lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.argtypes == []
+    assert lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.restype is ctypes.c_void_p
+    assert lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.argtypes == [
+        ctypes.c_void_p,
+        ctypes.POINTER(SteamNetworkingIdentity),
+    ]
+    assert lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.restype is ctypes.c_bool
+
+
+def test_networking_identity_layout():
+    assert ctypes.sizeof(SteamNetworkingIdentity) == 136
+    assert ctypes.alignment(SteamNetworkingIdentity) == 1
+    assert offsets(SteamNetworkingIdentity) == [0, 4, 8]
+
+
+def test_networking_ip_addr_layout():
+    assert ctypes.sizeof(SteamNetworkingIPAddr) == 18
+    assert ctypes.alignment(SteamNetworkingIPAddr) == 1
+
+
+def test_connection_info_layout():
+    assert ctypes.sizeof(SteamNetConnectionInfo) == 696
+    assert ctypes.alignment(SteamNetConnectionInfo) == 8
+    assert offsets(SteamNetConnectionInfo) == [
+        0,  # m_identityRemote
+        136,  # m_nUserData
+        144,  # m_hListenSocket
+        148,  # m_addrRemote
+        166,  # m__pad1
+        168,  # m_idPOPRemote
+        172,  # m_idPOPRelay
+        176,  # m_eState
+        180,  # m_eEndReason
+        184,  # m_szEndDebug
+        312,  # m_szConnectionDescription
+        440,  # m_nFlags
+        444,  # reserved
+    ]
+
+
+def test_connection_status_changed_layout():
+    assert CONNECTION_STATUS_CHANGED == 1220 + 1
+    assert ctypes.sizeof(SteamNetConnectionStatusChangedCallback) == 712
+    assert offsets(SteamNetConnectionStatusChangedCallback) == [0, 8, 704]
+
+
+def test_connection_state_values():
+    assert {state.name: state.value for state in ConnectionState} == {
+        "NONE": 0,
+        "CONNECTING": 1,
+        "FINDING_ROUTE": 2,
+        "CONNECTED": 3,
+        "CLOSED_BY_PEER": 4,
+        "PROBLEM_DETECTED_LOCALLY": 5,
+        "FIN_WAIT": -1,
+        "LINGER": -2,
+        "DEAD": -3,
+    }
+
+
+def steam_identity(steam_id, identity_type=16):
+    identity = SteamNetworkingIdentity(identity_type, 8)
+    identity.m_data[:8] = steam_id.to_bytes(8, "little")
+    return identity
+
+
+def test_identity_steam_id():
+    assert identity_steam_id(steam_identity(76561197960265729)) == 76561197960265729
+
+
+@pytest.mark.parametrize("identity_type", [0, 1, 2, 18])
+def test_identity_steam_id_other_types(identity_type):
+    assert identity_steam_id(steam_identity(76561197960265729, identity_type)) == 0
 
 
 def test_missing_export():

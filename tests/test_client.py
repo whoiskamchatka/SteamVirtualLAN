@@ -20,12 +20,14 @@ from steamlan.steam.native import (
     SteamAPICallCompleted,
     SteamAPIInitResult,
     SteamErrMsg,
+    SteamNetworkingIdentity,
 )
 
 DLL_PATH = r"C:\steam\steam_api64.dll"
 USER = 0x1000
 FRIENDS = 0x2000
 MATCHMAKING = 0x3000
+SOCKETS = 0x4000
 STEAM_ID = 76561197960265729
 OTHER_STEAM_ID = 76561197960265730
 LOBBY_ID = 109775240917097000
@@ -40,6 +42,16 @@ def init_result(result, message=b""):
     return init
 
 
+def fill_identity(steam_id, identity_type=16, known=True):
+    def get_identity(sockets, identity):
+        identity.m_eType = identity_type
+        identity.m_cbSize = 8
+        identity.m_data[:8] = steam_id.to_bytes(8, "little")
+        return known
+
+    return get_identity
+
+
 @pytest.fixture
 def lib():
     lib = mock.Mock()
@@ -51,6 +63,8 @@ def lib():
     lib.SteamAPI_GetHSteamPipe.return_value = PIPE
     lib.SteamAPI_ManualDispatch_GetNextCallback.return_value = False
     lib.SteamAPI_SteamMatchmaking_v009.return_value = MATCHMAKING
+    lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.return_value = SOCKETS
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.side_effect = fill_identity(STEAM_ID)
     return lib
 
 
@@ -843,3 +857,69 @@ def test_invite_to_lobby_invalid_ids(steam, lib, lobby_id, friend_id, message):
         steam.invite_to_lobby(lobby_id, friend_id)
 
     lib.SteamAPI_ISteamMatchmaking_InviteUserToLobby.assert_not_called()
+
+
+def test_networking_steam_id(steam, lib):
+    steam_id = steam.networking_steam_id
+
+    assert steam_id == STEAM_ID == steam.steam_id
+    assert type(steam_id) is int
+    sockets, identity = lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.call_args.args
+    assert sockets == SOCKETS
+    assert isinstance(identity, SteamNetworkingIdentity)
+
+
+def test_networking_steam_id_before_start(load, lib):
+    steam = SteamClient(DLL_PATH)
+
+    with pytest.raises(SteamError, match="not running"):
+        _ = steam.networking_steam_id
+
+    load.assert_not_called()
+    lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.assert_not_called()
+
+
+def test_networking_steam_id_after_close(load, lib):
+    steam = SteamClient(DLL_PATH)
+    steam.start()
+    steam.close()
+
+    with pytest.raises(SteamError, match="not running"):
+        _ = steam.networking_steam_id
+
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.assert_not_called()
+
+
+def test_networking_steam_id_without_sockets_interface(steam, lib):
+    lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.return_value = None
+
+    with pytest.raises(SteamError, match="ISteamNetworkingSockets"):
+        _ = steam.networking_steam_id
+
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.assert_not_called()
+
+
+def test_networking_identity_not_known(steam, lib):
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.side_effect = fill_identity(
+        0, identity_type=0, known=False
+    )
+
+    with pytest.raises(SteamError, match="not known yet"):
+        _ = steam.networking_steam_id
+
+
+@pytest.mark.parametrize("identity_type", [0, 1, 2])
+def test_networking_identity_not_a_steam_id(steam, lib, identity_type):
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.side_effect = fill_identity(
+        STEAM_ID, identity_type=identity_type
+    )
+
+    with pytest.raises(SteamError, match=f"not a SteamID \\(type {identity_type}\\)"):
+        _ = steam.networking_steam_id
+
+
+def test_networking_identity_empty_steam_id(steam, lib):
+    lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.side_effect = fill_identity(0)
+
+    with pytest.raises(SteamError, match="not a SteamID"):
+        _ = steam.networking_steam_id

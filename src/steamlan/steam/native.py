@@ -93,6 +93,84 @@ class ChatMemberStateChange(enum.IntFlag):
     BANNED = 0x10
 
 
+HSteamNetConnection = ctypes.c_uint32
+HSteamListenSocket = ctypes.c_uint32
+SteamNetworkingPOPID = ctypes.c_uint32
+
+IDENTITY_TYPE_STEAM_ID = 16  # k_ESteamNetworkingIdentityType_SteamID
+
+
+# steamnetworkingtypes.h declares this under #pragma pack(1). The union holding
+# the actual identity is 128 bytes; only the SteamID member is read here.
+class SteamNetworkingIdentity(ctypes.Structure):
+    _pack_ = 1
+    _layout_ = "ms"
+    _fields_ = [
+        ("m_eType", ctypes.c_int),
+        ("m_cbSize", ctypes.c_int),
+        ("m_data", ctypes.c_uint8 * 128),
+    ]
+
+
+def identity_steam_id(identity: SteamNetworkingIdentity) -> int:
+    """Same as SteamNetworkingIdentity::GetSteamID64(): 0 unless it is a SteamID."""
+    if identity.m_eType != IDENTITY_TYPE_STEAM_ID:
+        return 0
+    return int.from_bytes(bytes(identity.m_data[:8]), "little")
+
+
+# Also #pragma pack(1): a 16-byte IPv6 address followed by the port.
+class SteamNetworkingIPAddr(ctypes.Structure):
+    _pack_ = 1
+    _layout_ = "ms"
+    _fields_ = [
+        ("m_ipv6", ctypes.c_uint8 * 16),
+        ("m_port", ctypes.c_uint16),
+    ]
+
+
+class ConnectionState(enum.IntEnum):
+    NONE = 0
+    CONNECTING = 1
+    FINDING_ROUTE = 2
+    CONNECTED = 3
+    CLOSED_BY_PEER = 4
+    PROBLEM_DETECTED_LOCALLY = 5
+    FIN_WAIT = -1
+    LINGER = -2
+    DEAD = -3
+
+
+class SteamNetConnectionInfo(ctypes.Structure):
+    _fields_ = [
+        ("m_identityRemote", SteamNetworkingIdentity),
+        ("m_nUserData", ctypes.c_int64),
+        ("m_hListenSocket", HSteamListenSocket),
+        ("m_addrRemote", SteamNetworkingIPAddr),
+        ("m__pad1", ctypes.c_uint16),
+        ("m_idPOPRemote", SteamNetworkingPOPID),
+        ("m_idPOPRelay", SteamNetworkingPOPID),
+        ("m_eState", ctypes.c_int),
+        ("m_eEndReason", ctypes.c_int),
+        ("m_szEndDebug", ctypes.c_char * 128),
+        ("m_szConnectionDescription", ctypes.c_char * 128),
+        ("m_nFlags", ctypes.c_int),
+        ("reserved", ctypes.c_uint32 * 63),
+    ]
+
+
+class SteamNetConnectionStatusChangedCallback(ctypes.Structure):
+    _fields_ = [
+        ("m_hConn", HSteamNetConnection),
+        ("m_info", SteamNetConnectionInfo),
+        ("m_eOldState", ctypes.c_int),
+    ]
+
+
+# SteamNetConnectionStatusChangedCallback_t::k_iCallback
+CONNECTION_STATUS_CHANGED = 1221
+
+
 def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     """Declare signatures for the Steamworks flat API functions SteamLAN calls."""
     try:
@@ -181,15 +259,24 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
             ctypes.c_uint64,
         ]
         lib.SteamAPI_ISteamMatchmaking_InviteUserToLobby.restype = ctypes.c_bool
+
+        lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.argtypes = []
+        lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013.restype = ctypes.c_void_p
+
+        lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(SteamNetworkingIdentity),
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.restype = ctypes.c_bool
     except AttributeError as exc:
         raise SteamAPILoadError(f"unsupported {STEAM_API_DLL}: {exc}") from exc
 
     return lib
 
 
-# Same as the header's inline SteamAPI_SteamUser(), SteamAPI_SteamFriends() and
-# SteamAPI_SteamMatchmaking(): the exported accessors are versioned, so the
-# versions live only here.
+# Same as the header's inline SteamAPI_SteamUser(), SteamAPI_SteamFriends(),
+# SteamAPI_SteamMatchmaking() and SteamAPI_SteamNetworkingSockets_SteamAPI():
+# the exported accessors are versioned, so the versions live only here.
 def steam_user(lib: ctypes.CDLL) -> int | None:
     return lib.SteamAPI_SteamUser_v023()
 
@@ -200,3 +287,7 @@ def steam_friends(lib: ctypes.CDLL) -> int | None:
 
 def steam_matchmaking(lib: ctypes.CDLL) -> int | None:
     return lib.SteamAPI_SteamMatchmaking_v009()
+
+
+def steam_networking_sockets(lib: ctypes.CDLL) -> int | None:
+    return lib.SteamAPI_SteamNetworkingSockets_SteamAPI_v013()
