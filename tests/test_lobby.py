@@ -2,51 +2,22 @@ import pytest
 
 from steamlan.steam import (
     ChatMemberStateChange,
-    LobbyJoinRequest,
     LobbyMemberUpdate,
     SteamCallback,
     SteamError,
     decode_lobby_event,
 )
-from steamlan.steam.native import (
-    GAME_LOBBY_JOIN_REQUESTED,
-    LOBBY_CHAT_UPDATE,
-    GameLobbyJoinRequested,
-    LobbyChatUpdate,
-)
+from steamlan.steam.native import LOBBY_CHAT_UPDATE, LobbyChatUpdate
 
 LOBBY_ID = 109775240917097000
 HOST_ID = 76561197960265729
 GUEST_ID = 76561197960265730
 
 
-def join_requested(lobby_id=LOBBY_ID, friend_id=HOST_ID):
-    return SteamCallback(
-        GAME_LOBBY_JOIN_REQUESTED, bytes(GameLobbyJoinRequested(lobby_id, friend_id))
-    )
-
-
 def chat_update(state, user_id=GUEST_ID, changed_by=GUEST_ID):
     return SteamCallback(
         LOBBY_CHAT_UPDATE, bytes(LobbyChatUpdate(LOBBY_ID, user_id, changed_by, state))
     )
-
-
-def test_join_request():
-    event = decode_lobby_event(join_requested())
-
-    assert event == LobbyJoinRequest(lobby_id=LOBBY_ID, friend_id=HOST_ID)
-    assert type(event.lobby_id) is int
-    assert type(event.friend_id) is int
-
-
-def test_join_request_without_friend():
-    assert decode_lobby_event(join_requested(friend_id=0)).friend_id is None
-
-
-def test_join_request_without_lobby():
-    with pytest.raises(SteamError, match="without a lobby ID"):
-        decode_lobby_event(join_requested(lobby_id=0))
 
 
 @pytest.mark.parametrize(
@@ -84,7 +55,6 @@ def test_member_update_combined_flags():
 @pytest.mark.parametrize(
     "callback",
     [
-        SteamCallback(GAME_LOBBY_JOIN_REQUESTED, bytes(GameLobbyJoinRequested())[:8]),
         SteamCallback(LOBBY_CHAT_UPDATE, bytes(LobbyChatUpdate())[:28]),
         SteamCallback(LOBBY_CHAT_UPDATE, bytes(LobbyChatUpdate()) + b"\x00"),
     ],

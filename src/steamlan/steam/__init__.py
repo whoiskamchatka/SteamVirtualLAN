@@ -5,13 +5,12 @@ from steamlan.steam.loader import (
     SteamAPINotFoundError,
     load_steam_api,
 )
-from steamlan.steam.lobby import LobbyJoinRequest, LobbyMemberUpdate, decode_lobby_event
+from steamlan.steam.lobby import LobbyMemberUpdate, decode_lobby_event
 from steamlan.steam.native import ChatMemberStateChange, LobbyType
 
 __all__ = [
     "STEAM_API_DLL",
     "ChatMemberStateChange",
-    "LobbyJoinRequest",
     "LobbyMemberUpdate",
     "LobbyType",
     "SteamAPILoadError",

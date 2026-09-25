@@ -8,7 +8,7 @@ The project is still very early in development.
 
 ## Status
 
-Nothing usable yet. Through a small internal Python binding, SteamVirtualLAN can currently initialize the Steam API, read the current user's name and SteamID, pump Steam callbacks, and create and leave a Steam lobby. Inviting a friend and joining their lobby is implemented but has not been tested between two Steam accounts yet.
+Nothing usable yet. Through a small internal Python binding, SteamVirtualLAN can currently initialize the Steam API, read the current user's name and SteamID, create a Steam lobby, invite a Steam friend to it and see members enter and leave.
 
 Windows is the initial target.
 
@@ -54,7 +54,7 @@ python scripts/check_steam.py
 
 The script initializes the Steam API, prints your Steam name and SteamID, creates a friends-only lobby, checks that you are a member, leaves it and shuts down again.
 
-To test lobby invites you need two Steam accounts that are friends, on two PCs with the same setup. Start `python scripts/join_lobby.py` on one, then `python scripts/host_lobby.py <SteamID>` on the other with the joining account's SteamID, and accept the invite in Steam on the joining PC. The Steam overlay can't show its invite dialog for these console scripts, so the host sends the invite directly. Stop either script with Ctrl+C.
+To test lobby invites you need a second Steam account that is your friend, signed in on another PC. Run `python scripts/host_lobby.py <SteamID>` with the friend's SteamID. The friend accepts the invitation from Steam chat and Steam joins them to the lobby; the script prints members as they enter and leave. Stop it with Ctrl+C.
 
 ## Disclaimer
 

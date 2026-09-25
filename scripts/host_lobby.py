@@ -1,25 +1,53 @@
-"""Create a friends-only lobby and show friends joining and leaving it.
+"""Create a friends-only lobby, invite a friend and show members joining and leaving.
 
-Usage: python scripts/host_lobby.py [FRIEND_STEAM_ID]
+Usage: python scripts/host_lobby.py FRIEND_STEAM_ID
 
-Asks Steam to open its invite dialog for the lobby. The overlay can only show
-it in a process it has hooked, so a friend's SteamID can also be given to send
-them an invite directly. Stop with Ctrl+C.
+The friend accepts the invite from Steam chat and Steam joins them to the
+lobby. Stop with Ctrl+C.
 """
 
 import sys
+import time
 
-from local_steam import STEAM_ERRORS, local_client, print_members, watch_members
+from local_steam import STEAM_ERRORS, local_client
+
+from steamlan.steam import (
+    ChatMemberStateChange,
+    LobbyMemberUpdate,
+    SteamClient,
+    decode_lobby_event,
+)
 
 MAX_MEMBERS = 8
+POLL_INTERVAL = 0.05
+
+
+def print_members(steam: SteamClient, lobby_id: int) -> None:
+    members = steam.lobby_members(lobby_id)
+    print(f"Members: {len(members)}")
+    for member in members:
+        print(f"  {member}")
+
+
+def watch_members(steam: SteamClient, lobby_id: int) -> None:
+    while True:
+        for callback in steam.run_callbacks():
+            event = decode_lobby_event(callback)
+            if not isinstance(event, LobbyMemberUpdate) or event.lobby_id != lobby_id:
+                continue
+            if ChatMemberStateChange.ENTERED in event.state:
+                print(f"Member joined: {event.user_id}")
+            else:
+                print(f"Member left: {event.user_id} ({event.state.name})")
+            print_members(steam, lobby_id)
+        time.sleep(POLL_INTERVAL)
 
 
 def main() -> int:
-    args = sys.argv[1:]
-    if len(args) > 1 or (args and not args[0].isdigit()):
-        print("usage: python scripts/host_lobby.py [FRIEND_STEAM_ID]", file=sys.stderr)
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        print("usage: python scripts/host_lobby.py FRIEND_STEAM_ID", file=sys.stderr)
         return 2
-    friend_id = int(args[0]) if args else None
+    friend_id = int(sys.argv[1])
 
     try:
         with local_client() as steam:
@@ -30,13 +58,12 @@ def main() -> int:
                 print(f"Lobby created: {lobby_id}")
                 print_members(steam, lobby_id)
 
-                print("Opening Steam invite dialog...")
-                steam.open_lobby_invite(lobby_id)
-                if friend_id:
-                    print(f"Inviting {friend_id}...")
-                    steam.invite_to_lobby(lobby_id, friend_id)
+                print(f"Inviting {friend_id}...")
+                steam.invite_to_lobby(lobby_id, friend_id)
+                print("Invite sent.")
+                print("Ask your friend to accept/join from the Steam chat invitation.")
 
-                print("Waiting for players (Ctrl+C to stop)...")
+                print("Waiting for members (Ctrl+C to stop)...")
                 watch_members(steam, lobby_id)
             finally:
                 print("Leaving lobby...")
