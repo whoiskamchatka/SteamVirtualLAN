@@ -100,3 +100,33 @@ def test_call_result_is_not_decoded_as_event():
     callback = SteamCallback(CONNECTION_STATUS_CHANGED, status_changed().payload, api_call=5)
 
     assert decode_networking_event(callback) is callback
+
+
+@pytest.mark.parametrize(
+    ("state", "listen_socket", "incoming", "ended"),
+    [
+        (ConnectionState.CONNECTING, LISTEN_SOCKET, True, False),
+        (ConnectionState.CONNECTING, 0, False, False),
+        (ConnectionState.FINDING_ROUTE, 0, False, False),
+        (ConnectionState.CONNECTED, LISTEN_SOCKET, False, False),
+        (ConnectionState.CONNECTED, 0, False, False),
+        (ConnectionState.CLOSED_BY_PEER, LISTEN_SOCKET, False, True),
+        (ConnectionState.PROBLEM_DETECTED_LOCALLY, 0, False, True),
+        (ConnectionState.NONE, 0, False, False),
+    ],
+    ids=[
+        "incoming-connecting",
+        "outgoing-connecting",
+        "finding-route",
+        "connected-inbound",
+        "connected-outbound",
+        "closed-by-peer",
+        "problem-detected-locally",
+        "none",
+    ],
+)
+def test_connection_event_kind(state, listen_socket, incoming, ended):
+    event = decode_networking_event(status_changed(state=state, listen_socket=listen_socket))
+
+    assert event.incoming is incoming
+    assert event.ended is ended

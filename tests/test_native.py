@@ -8,9 +8,12 @@ from steamlan.steam.native import (
     CONNECTION_STATUS_CHANGED,
     LOBBY_CHAT_UPDATE,
     LOBBY_CREATED,
+    NET_HANDLE_INVALID,
+    SEND_RELIABLE,
     CallbackMsg,
     ChatMemberStateChange,
     ConnectionState,
+    EResult,
     HSteamPipe,
     LobbyChatUpdate,
     LobbyCreated,
@@ -21,6 +24,7 @@ from steamlan.steam.native import (
     SteamNetConnectionStatusChangedCallback,
     SteamNetworkingIdentity,
     SteamNetworkingIPAddr,
+    SteamNetworkingMessage,
     bind,
     identity_steam_id,
 )
@@ -244,6 +248,81 @@ def test_identity_steam_id():
 @pytest.mark.parametrize("identity_type", [0, 1, 2, 18])
 def test_identity_steam_id_other_types(identity_type):
     assert identity_steam_id(steam_identity(76561197960265729, identity_type)) == 0
+
+
+def test_p2p_signatures():
+    lib = bind(mock.Mock())
+    uint32, int_, void_p = ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p
+    identity_p = ctypes.POINTER(SteamNetworkingIdentity)
+
+    expected = {
+        "SteamAPI_SteamNetworkingIdentity_SetSteamID64": ([identity_p, ctypes.c_uint64], None),
+        "SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P": (
+            [void_p, int_, int_, void_p],
+            uint32,
+        ),
+        "SteamAPI_ISteamNetworkingSockets_ConnectP2P": (
+            [void_p, identity_p, int_, int_, void_p],
+            uint32,
+        ),
+        "SteamAPI_ISteamNetworkingSockets_AcceptConnection": ([void_p, uint32], int_),
+        "SteamAPI_ISteamNetworkingSockets_CloseConnection": (
+            [void_p, uint32, int_, ctypes.c_char_p, ctypes.c_bool],
+            ctypes.c_bool,
+        ),
+        "SteamAPI_ISteamNetworkingSockets_CloseListenSocket": ([void_p, uint32], ctypes.c_bool),
+        "SteamAPI_ISteamNetworkingSockets_SendMessageToConnection": (
+            [void_p, uint32, void_p, uint32, int_, ctypes.POINTER(ctypes.c_int64)],
+            int_,
+        ),
+        "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection": (
+            [void_p, uint32, ctypes.POINTER(ctypes.POINTER(SteamNetworkingMessage)), int_],
+            int_,
+        ),
+        "SteamAPI_SteamNetworkingMessage_t_Release": (
+            [ctypes.POINTER(SteamNetworkingMessage)],
+            None,
+        ),
+    }
+    for name, (argtypes, restype) in expected.items():
+        function = getattr(lib, name)
+        assert function.argtypes == argtypes, name
+        assert function.restype is restype, name
+
+
+def test_networking_message_layout():
+    assert ctypes.sizeof(SteamNetworkingMessage) == 216
+    assert ctypes.alignment(SteamNetworkingMessage) == 8
+    assert {
+        name: getattr(SteamNetworkingMessage, name).offset
+        for name, _ in SteamNetworkingMessage._fields_
+    } == {
+        "m_pData": 0,
+        "m_cbSize": 8,
+        "m_conn": 12,
+        "m_identityPeer": 16,
+        "m_nConnUserData": 152,
+        "m_usecTimeReceived": 160,
+        "m_nMessageNumber": 168,
+        "m_pfnFreeData": 176,
+        "m_pfnRelease": 184,
+        "m_nChannel": 192,
+        "m_nFlags": 196,
+        "m_nUserData": 200,
+        "m_idxLane": 208,
+        "_pad1__": 210,
+    }
+
+
+def test_networking_constants():
+    assert NET_HANDLE_INVALID == 0
+    assert SEND_RELIABLE == 8
+    assert (EResult.OK, EResult.INVALID_PARAM, EResult.INVALID_STATE, EResult.IGNORED) == (
+        1,
+        8,
+        11,
+        41,
+    )
 
 
 def test_missing_export():

@@ -22,6 +22,19 @@ class ConnectionStatusChange:
     end_reason: int
     end_debug: str
 
+    @property
+    def incoming(self) -> bool:
+        """A peer is connecting to one of our listen sockets and can be accepted."""
+        return self.state is ConnectionState.CONNECTING and self.listen_socket != 0
+
+    @property
+    def ended(self) -> bool:
+        """The connection is over; it still has to be closed to free the handle."""
+        return self.state in (
+            ConnectionState.CLOSED_BY_PEER,
+            ConnectionState.PROBLEM_DETECTED_LOCALLY,
+        )
+
 
 def _state(value: int) -> ConnectionState:
     try:

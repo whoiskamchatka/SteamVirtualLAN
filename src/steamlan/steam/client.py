@@ -2,11 +2,14 @@ import ctypes
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from steamlan.steam.loader import load_steam_api
 from steamlan.steam.native import (
     API_CALL_INVALID,
     LOBBY_CREATED,
+    NET_HANDLE_INVALID,
+    SEND_RELIABLE,
     STEAM_API_CALL_COMPLETED,
     CallbackMsg,
     EResult,
@@ -16,6 +19,7 @@ from steamlan.steam.native import (
     SteamAPIInitResult,
     SteamErrMsg,
     SteamNetworkingIdentity,
+    SteamNetworkingMessage,
     bind,
     identity_steam_id,
     steam_friends,
@@ -112,8 +116,25 @@ def _read_lobby_created(callback: SteamCallback) -> int:
 
 
 def _check_steam_id(steam_id: int, what: str) -> None:
-    if not steam_id:
+    if not 0 < steam_id < 2**64:
         raise ValueError(f"invalid {what}: {steam_id}")
+
+
+def _check_result(result: int, call: str) -> None:
+    if result != EResult.OK:
+        raise SteamError(f"{call} failed: {_result_name(result)}")
+
+
+def _message_payload(pointer: Any, connection: int) -> bytes:
+    if not pointer:
+        raise SteamError("Steam returned a null message")
+    message = pointer.contents
+    size = message.m_cbSize
+    if size < 0 or (size and not message.m_pData):
+        raise SteamError(f"Steam returned a malformed message ({size} bytes)")
+    if message.m_conn != connection:
+        raise SteamError(f"Steam returned a message for connection {message.m_conn}")
+    return ctypes.string_at(message.m_pData, size) if size else b""
 
 
 class SteamClient:
@@ -182,12 +203,8 @@ class SteamClient:
     def networking_steam_id(self) -> int:
         """SteamID of the local SteamNetworkingSockets identity."""
         lib = self._running_lib()
-        sockets = steam_networking_sockets(lib)
-        if not sockets:
-            raise SteamError("could not get the ISteamNetworkingSockets interface")
-
         identity = SteamNetworkingIdentity()
-        if not lib.SteamAPI_ISteamNetworkingSockets_GetIdentity(sockets, identity):
+        if not lib.SteamAPI_ISteamNetworkingSockets_GetIdentity(self._sockets(lib), identity):
             raise SteamError("Steam networking identity is not known yet")
         steam_id = identity_steam_id(identity)
         if not steam_id:
@@ -247,6 +264,83 @@ class SteamClient:
             raise SteamError("Steam returned an empty SteamID for a lobby member")
         return members
 
+    def create_listen_socket(self, virtual_port: int = 0) -> int:
+        lib = self._running_lib()
+        listen_socket = lib.SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P(
+            self._sockets(lib), virtual_port, 0, None
+        )
+        if listen_socket == NET_HANDLE_INVALID:
+            raise SteamError("CreateListenSocketP2P failed")
+        return listen_socket
+
+    def close_listen_socket(self, listen_socket: int) -> bool:
+        """Close a listen socket; returns False if Steam no longer knew the handle."""
+        lib = self._running_lib()
+        return lib.SteamAPI_ISteamNetworkingSockets_CloseListenSocket(
+            self._sockets(lib), listen_socket
+        )
+
+    def connect_p2p(self, remote_steam_id: int, virtual_port: int = 0) -> int:
+        lib = self._running_lib()
+        _check_steam_id(remote_steam_id, "remote SteamID")
+        identity = SteamNetworkingIdentity()
+        lib.SteamAPI_SteamNetworkingIdentity_SetSteamID64(identity, remote_steam_id)
+        connection = lib.SteamAPI_ISteamNetworkingSockets_ConnectP2P(
+            self._sockets(lib), identity, virtual_port, 0, None
+        )
+        if connection == NET_HANDLE_INVALID:
+            raise SteamError("ConnectP2P failed")
+        return connection
+
+    def accept_connection(self, connection: int) -> None:
+        lib = self._running_lib()
+        result = lib.SteamAPI_ISteamNetworkingSockets_AcceptConnection(
+            self._sockets(lib), connection
+        )
+        _check_result(result, "AcceptConnection")
+
+    def close_connection(self, connection: int, debug: str = "") -> bool:
+        """Close a connection; returns False if Steam no longer knew the handle.
+
+        Also required after the peer closed it or it failed, to free the handle.
+        """
+        lib = self._running_lib()
+        # Reason 0 is k_ESteamNetConnectionEnd_App_Generic. Without linger,
+        # reliable data that has not been sent yet is dropped.
+        return lib.SteamAPI_ISteamNetworkingSockets_CloseConnection(
+            self._sockets(lib), connection, 0, debug.encode(), False
+        )
+
+    def send_message(self, connection: int, data: bytes) -> None:
+        """Send data as one reliable message."""
+        lib = self._running_lib()
+        data = bytes(data)
+        result = lib.SteamAPI_ISteamNetworkingSockets_SendMessageToConnection(
+            self._sockets(lib), connection, data, len(data), SEND_RELIABLE, None
+        )
+        _check_result(result, "SendMessageToConnection")
+
+    def receive_messages(self, connection: int, max_messages: int = 32) -> list[bytes]:
+        lib = self._running_lib()
+        received = (ctypes.POINTER(SteamNetworkingMessage) * max_messages)()
+        count = lib.SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection(
+            self._sockets(lib), connection, received, max_messages
+        )
+        if count < 0:
+            raise SteamError(f"ReceiveMessagesOnConnection failed for connection {connection}")
+
+        messages = received[: min(count, max_messages)]
+        try:
+            if count > max_messages:
+                raise SteamError(f"Steam returned {count} messages for {max_messages} slots")
+            return [_message_payload(message, connection) for message in messages]
+        finally:
+            # Steam owns every returned message. Payloads are copied above, and
+            # each message is released exactly once, even if one was malformed.
+            for message in messages:
+                if message:
+                    lib.SteamAPI_SteamNetworkingMessage_t_Release(message)
+
     def _wait_for_call(self, api_call: int, timeout: float) -> SteamCallback:
         lib = self._running_lib()
         deadline = time.monotonic() + timeout
@@ -262,6 +356,12 @@ class SteamClient:
             if time.monotonic() >= deadline:
                 raise SteamError(f"timed out after {timeout:g}s waiting for Steam API call")
             time.sleep(_CALL_POLL_INTERVAL)
+
+    def _sockets(self, lib: ctypes.CDLL) -> int:
+        sockets = steam_networking_sockets(lib)
+        if not sockets:
+            raise SteamError("could not get the ISteamNetworkingSockets interface")
+        return sockets
 
     def _matchmaking(self, lib: ctypes.CDLL) -> int:
         matchmaking = steam_matchmaking(lib)

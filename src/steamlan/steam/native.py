@@ -51,14 +51,17 @@ class LobbyType(enum.IntEnum):
     INVISIBLE = 3
 
 
-# Only the EResult values Valve documents for LobbyCreated_t.
+# Only the EResult values Valve documents for the calls SteamLAN makes.
 class EResult(enum.IntEnum):
     OK = 1
     FAIL = 2
     NO_CONNECTION = 3
+    INVALID_PARAM = 8
+    INVALID_STATE = 11
     ACCESS_DENIED = 15
     TIMEOUT = 16
     LIMIT_EXCEEDED = 25
+    IGNORED = 41
 
 
 # EResult is a C int; under pack(8) the uint64 after it is 8-byte aligned,
@@ -170,6 +173,32 @@ class SteamNetConnectionStatusChangedCallback(ctypes.Structure):
 # SteamNetConnectionStatusChangedCallback_t::k_iCallback
 CONNECTION_STATUS_CHANGED = 1221
 
+# k_HSteamNetConnection_Invalid and k_HSteamListenSocket_Invalid
+NET_HANDLE_INVALID = 0
+
+SEND_RELIABLE = 8  # k_nSteamNetworkingSend_Reliable
+
+
+# Declared outside any #pragma pack, so it uses the default x64 layout. Steam
+# owns received messages; they must be released, never freed directly.
+class SteamNetworkingMessage(ctypes.Structure):
+    _fields_ = [
+        ("m_pData", ctypes.c_void_p),
+        ("m_cbSize", ctypes.c_int),
+        ("m_conn", HSteamNetConnection),
+        ("m_identityPeer", SteamNetworkingIdentity),
+        ("m_nConnUserData", ctypes.c_int64),
+        ("m_usecTimeReceived", ctypes.c_int64),
+        ("m_nMessageNumber", ctypes.c_int64),
+        ("m_pfnFreeData", ctypes.c_void_p),
+        ("m_pfnRelease", ctypes.c_void_p),
+        ("m_nChannel", ctypes.c_int),
+        ("m_nFlags", ctypes.c_int),
+        ("m_nUserData", ctypes.c_int64),
+        ("m_idxLane", ctypes.c_uint16),
+        ("_pad1__", ctypes.c_uint16),
+    ]
+
 
 def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     """Declare signatures for the Steamworks flat API functions SteamLAN calls."""
@@ -268,6 +297,75 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
             ctypes.POINTER(SteamNetworkingIdentity),
         ]
         lib.SteamAPI_ISteamNetworkingSockets_GetIdentity.restype = ctypes.c_bool
+
+        lib.SteamAPI_SteamNetworkingIdentity_SetSteamID64.argtypes = [
+            ctypes.POINTER(SteamNetworkingIdentity),
+            ctypes.c_uint64,
+        ]
+        lib.SteamAPI_SteamNetworkingIdentity_SetSteamID64.restype = None
+
+        # The config option arguments are always passed as 0 and NULL.
+        lib.SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P.restype = HSteamListenSocket
+
+        # identityRemote is a C++ reference, passed as a pointer.
+        lib.SteamAPI_ISteamNetworkingSockets_ConnectP2P.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(SteamNetworkingIdentity),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_ConnectP2P.restype = HSteamNetConnection
+
+        lib.SteamAPI_ISteamNetworkingSockets_AcceptConnection.argtypes = [
+            ctypes.c_void_p,
+            HSteamNetConnection,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_AcceptConnection.restype = ctypes.c_int
+
+        lib.SteamAPI_ISteamNetworkingSockets_CloseConnection.argtypes = [
+            ctypes.c_void_p,
+            HSteamNetConnection,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_bool,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_CloseConnection.restype = ctypes.c_bool
+
+        lib.SteamAPI_ISteamNetworkingSockets_CloseListenSocket.argtypes = [
+            ctypes.c_void_p,
+            HSteamListenSocket,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_CloseListenSocket.restype = ctypes.c_bool
+
+        lib.SteamAPI_ISteamNetworkingSockets_SendMessageToConnection.argtypes = [
+            ctypes.c_void_p,
+            HSteamNetConnection,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_SendMessageToConnection.restype = ctypes.c_int
+
+        lib.SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection.argtypes = [
+            ctypes.c_void_p,
+            HSteamNetConnection,
+            ctypes.POINTER(ctypes.POINTER(SteamNetworkingMessage)),
+            ctypes.c_int,
+        ]
+        lib.SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection.restype = ctypes.c_int
+
+        lib.SteamAPI_SteamNetworkingMessage_t_Release.argtypes = [
+            ctypes.POINTER(SteamNetworkingMessage)
+        ]
+        lib.SteamAPI_SteamNetworkingMessage_t_Release.restype = None
     except AttributeError as exc:
         raise SteamAPILoadError(f"unsupported {STEAM_API_DLL}: {exc}") from exc
 
