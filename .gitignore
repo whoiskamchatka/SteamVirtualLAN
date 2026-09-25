@@ -17,7 +17,8 @@ env/
 .coverage
 htmlcov/
 
-# Steamworks SDK and redistributables (never commit Valve files)
+# Local Steamworks files and Valve SDK/redistributables (never commit these)
+/steamworks/
 sdk/
 steamworks_sdk*/
 steamworks_sdk*.zip
@@ -25,7 +26,6 @@ steam_api*.lib
 libsteam_api.so
 libsteam_api.dylib
 *.dll
-steam_appid.txt
 
 # Editors and OS
 .idea/
