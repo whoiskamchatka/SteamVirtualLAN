@@ -206,6 +206,14 @@ def test_send_message(steam, lib, data):
     assert message_number is None
 
 
+def test_send_message_unreliably(steam, lib):
+    steam.send_message(CONNECTION, b"packet", reliable=False)
+
+    flags = lib.SteamAPI_ISteamNetworkingSockets_SendMessageToConnection.call_args.args[4]
+    # k_nSteamNetworkingSend_UnreliableNoNagle
+    assert flags == 1
+
+
 @pytest.mark.parametrize(
     ("result", "message"),
     [(EResult.NO_CONNECTION, "NO_CONNECTION"), (EResult.LIMIT_EXCEEDED, "LIMIT_EXCEEDED")],

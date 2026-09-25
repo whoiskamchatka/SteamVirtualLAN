@@ -1,12 +1,19 @@
-"""A SteamVirtualLAN network: lobby members connected by LobbySession, admitted by the host."""
+"""A SteamVirtualLAN network: lobby members connected by LobbySession, admitted by the host.
+
+The host also gives every admitted member a virtual IP address and tells all
+members the whole SteamID -> address mapping. IP packets then go straight to
+the member that owns their destination address.
+"""
 
 import logging
 import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from ipaddress import IPv4Address
 
-from steamlan.app import access
+from steamlan.app import access, tunnel
+from steamlan.app.addresses import AddressPool
 from steamlan.steam import LobbySession, SteamCallback, SteamClient, SteamError
 
 log = logging.getLogger(__name__)
@@ -25,6 +32,7 @@ class MemberView:
     is_host: bool
     status: str
     tone: str  # "ok", "pending", "error" or "neutral"
+    address: str = ""  # virtual IP address, once the host assigned one
 
 
 def display_id(steam_id: int) -> str:
@@ -55,6 +63,13 @@ class NetworkSession:
         # Set on a member when the host refused it or stopped answering.
         self.refused = ""
         self.lobby = LobbySession(steam, lobby_id, listen_socket, log=log.info)
+        # SteamID -> virtual IP address. The host assigns them; members only
+        # learn them from the host and never pick their own.
+        self._pool = AddressPool(self.local_id) if self.is_host else None
+        self.addresses: dict[int, IPv4Address] = dict(self._pool.assigned) if self._pool else {}
+        # Checked IP packets from other members, waiting for the local adapter.
+        self._packets: list[bytes] = []
+        self.dropped_packets = 0
         self._waiting_since: dict[int, float] = {}
         self._failures: Counter[int] = Counter()
         self._auth_sent_at: float | None = None
@@ -68,8 +83,17 @@ class NetworkSession:
         """A member counts as joined once the host has approved it."""
         return self.is_host or self.host_id in self.approved
 
+    @property
+    def local_address(self) -> IPv4Address | None:
+        """This member's virtual IP address, once the host assigned it."""
+        return self.addresses.get(self.local_id)
+
     def process(self, callbacks: list[SteamCallback]) -> None:
         for steam_id, data in self.lobby.process(callbacks):
+            packet = tunnel.packet_payload(data)
+            if packet is not None:
+                self._receive_packet(steam_id, packet)
+                continue
             message = access.parse_message(data)
             if message is None:
                 continue
@@ -86,6 +110,38 @@ class NetworkSession:
     def close(self) -> None:
         self.lobby.close()
 
+    def send_packet(self, packet: bytes) -> bool:
+        """Send an IP packet from the local adapter to the member that owns its
+        destination address. False if it was dropped."""
+        owners = {
+            address: steam_id
+            for steam_id, address in self.addresses.items()
+            if steam_id in self.approved
+        }
+        steam_id = tunnel.destination_member(packet, self.local_address, owners)
+        if steam_id is None:
+            self.dropped_packets += 1
+            return False
+        try:
+            self.lobby.send(steam_id, tunnel.packet_message(packet), reliable=False)
+        except SteamError as exc:
+            log.debug("Dropped a packet for %s: %s", steam_id, exc)
+            self.dropped_packets += 1
+            return False
+        return True
+
+    def take_packets(self) -> list[bytes]:
+        """IP packets other members sent to this member since the last call."""
+        packets, self._packets = self._packets, []
+        return packets
+
+    def _receive_packet(self, steam_id: int, packet: bytes) -> None:
+        sender_address = self.addresses.get(steam_id) if steam_id in self.approved else None
+        if tunnel.accepts_packet(packet, sender_address, self.local_address):
+            self._packets.append(packet)
+        else:
+            self.dropped_packets += 1
+
     def members(self) -> list[MemberView]:
         if self.is_host:
             own_status, own_tone = "Hosting", "ok"
@@ -101,6 +157,7 @@ class NetworkSession:
                 is_host=self.is_host,
                 status=own_status,
                 tone=own_tone,
+                address=self._address_text(self.local_id),
             )
         ]
         for peer in self.lobby.peers.values():
@@ -115,6 +172,7 @@ class NetworkSession:
                     is_host=peer.steam_id == self.host_id,
                     status=status,
                     tone=tone,
+                    address=self._address_text(peer.steam_id),
                 )
             )
         views.sort(key=lambda view: (not view.is_host, not view.is_you, view.name.casefold()))
@@ -143,6 +201,10 @@ class NetworkSession:
             return "Connection lost", "error"
         return "Connecting", "pending"
 
+    def _address_text(self, steam_id: int) -> str:
+        address = self.addresses.get(steam_id)
+        return str(address) if address is not None else ""
+
     def _peer_status(self, peer) -> tuple[str, str]:
         if peer.ended:
             if self.is_host and peer.steam_id not in self.approved and "access" in peer.ended:
@@ -166,10 +228,16 @@ class NetworkSession:
             self._deny(steam_id, "wrong access code")
 
     def _approve(self, steam_id: int) -> None:
+        try:
+            address = self._pool.assign(steam_id)
+        except ValueError:
+            self._deny(steam_id, "the network is full")
+            return
+        self.addresses = dict(self._pool.assigned)
         self.approved.add(steam_id)
         self._waiting_since.pop(steam_id, None)
         self.lobby.send(steam_id, access.ACCEPTED)
-        log.info("Approved %s", steam_id)
+        log.info("Approved %s as %s", steam_id, address)
         self._send_members()
 
     def _deny(self, steam_id: int, reason: str) -> None:
@@ -186,6 +254,9 @@ class NetworkSession:
         gone = self.approved - set(self.lobby.peers)
         if gone:
             self.approved -= gone
+            for steam_id in gone:
+                self._pool.release(steam_id)
+            self.addresses = dict(self._pool.assigned)
             self._send_members()
 
         now = self.clock()
@@ -198,7 +269,8 @@ class NetworkSession:
             del self._waiting_since[steam_id]
 
     def _send_members(self) -> None:
-        message = access.members_message(sorted(self.approved | {self.local_id}))
+        """Tell every admitted member who is admitted, and everyone's address."""
+        message = access.members_message(self.addresses)
         for steam_id in self.approved & set(self.lobby.connected_peers()):
             self.lobby.send(steam_id, message)
 
@@ -212,7 +284,15 @@ class NetworkSession:
             else:
                 self.refused = "Ask the host for an invite or the access code"
         elif message.kind == "members":
-            self.approved = (set(message.members) | {self.host_id}) - {self.local_id}
+            addresses = dict(message.addresses)
+            own = addresses.get(self.local_id)
+            if self.host_id not in addresses or (
+                self.local_address is not None and own != self.local_address
+            ):
+                log.warning("Ignored a member list from the host that doesn't fit this network")
+                return
+            self.addresses = addresses
+            self.approved = (set(addresses) | {self.host_id}) - {self.local_id}
 
     def _member_checks(self) -> None:
         if self.refused or self.joined:

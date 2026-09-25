@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from steamlan.adapter.launcher import AdapterHelper, State
 from steamlan.app import access
 from steamlan.app.network import MemberView, NetworkSession
 from steamlan.app.steamworks import open_steam
@@ -48,6 +49,9 @@ class View:
     is_host: bool = False
     network_status: str = ""
     network_tone: str = "neutral"
+    # The local virtual adapter: starting, waiting for an address, or ready.
+    adapter_status: str = ""
+    adapter_tone: str = "neutral"
     members: tuple[MemberView, ...] = ()
 
 
@@ -84,9 +88,11 @@ class AppController:
         self,
         open_steam: Callable[[], SteamClient] = open_steam,
         clock: Callable[[], float] = time.monotonic,
+        make_helper: Callable[[], AdapterHelper] | None = None,
     ):
         self._open_steam = open_steam
         self.clock = clock
+        self._make_helper = make_helper or AdapterHelper
         self.steam: SteamClient | None = None
         self.persona = ""
         self.steam_error = ""
@@ -94,6 +100,8 @@ class AppController:
         self.busy = ""
         self.error = ""
         self.network: NetworkSession | None = None
+        # The elevated helper that owns the virtual adapter while in a network.
+        self.helper: AdapterHelper | None = None
         self._pending: _Pending | None = None
         self._lobby_id = 0
         self._listen_socket = 0
@@ -131,6 +139,7 @@ class AppController:
                 error=self.error,
             )
         status, tone = network.status()
+        adapter_status, adapter_tone = self._adapter_status(network)
         return View(
             Screen.LOBBY,
             True,
@@ -141,8 +150,27 @@ class AppController:
             is_host=network.is_host,
             network_status=status,
             network_tone=tone,
+            adapter_status=adapter_status,
+            adapter_tone=adapter_tone,
             members=tuple(network.members()),
         )
+
+    def _adapter_status(self, network: NetworkSession) -> tuple[str, str]:
+        helper = self.helper
+        if helper is None:
+            return "", "neutral"
+        if helper.state is State.STARTING:
+            return helper.progress, "pending"
+        if helper.state is State.FAILED:
+            return helper.error, "error"
+        if helper.state is not State.READY:
+            return "", "neutral"
+        address = network.local_address
+        if address is None:
+            return "Waiting for the host to assign an address", "pending"
+        if helper.address != address:
+            return f"Setting up {address}...", "pending"
+        return f"Virtual network ready: {address}", "ok"
 
     def show_join(self) -> None:
         if self.network is None and not self.busy:
@@ -251,10 +279,18 @@ class AppController:
 
         if self.network is not None:
             self.network.process(callbacks)
+            self._forward_packets()
             if self.network.refused and not self.network.joined:
                 reason = self.network.refused
                 self.leave()
                 self.screen = Screen.JOIN
+                self.error = reason
+            elif self.helper is not None and self.helper.state is State.FAILED:
+                # Without its adapter this PC can't take part; leave cleanly.
+                reason = self.helper.error
+                is_host = self.network.is_host
+                self.leave()
+                self.screen = Screen.HOME if is_host else Screen.JOIN
                 self.error = reason
         elif self._pending is None:
             for callback in callbacks:
@@ -274,6 +310,22 @@ class AppController:
                     log.info("Join requested for lobby %s", event.lobby_id)
                     self._start_join(event.lobby_id, "")
                     break
+
+    def _forward_packets(self) -> None:
+        """Move IP packets between the local adapter and the other members."""
+        network, helper = self.network, self.helper
+        if helper is None:
+            return
+        # Windows -> adapter -> helper -> the member that owns the destination.
+        for packet in helper.poll():
+            network.send_packet(packet)
+        # Other members -> helper -> adapter -> Windows. Packets that arrive
+        # before the adapter has its address are dropped, as IP allows.
+        received = network.take_packets()
+        if helper.ready and network.local_address is not None:
+            helper.set_address(network.local_address)
+            for packet in received:
+                helper.send_packet(packet)
 
     def _start_join(self, lobby_id: int, code: str) -> None:
         self.error = ""
@@ -336,11 +388,26 @@ class AppController:
         self.network = NetworkSession(
             self.steam, lobby_id, self._listen_socket, host_id, access_code, self.clock
         )
+        # The adapter comes up while Steam connects the members; the UAC
+        # prompt, if any, appears now.
+        self.helper = self._make_helper()
+        try:
+            self.helper.start()
+        except OSError as exc:
+            log.warning("Network helper: %s", exc)
+            self._leave_network()
+            self.error = "Could not start the virtual network"
+            return
         self.screen = Screen.LOBBY
         self.error = ""
 
     def _leave_network(self) -> None:
-        """Close peer connections, leave the lobby and close the listen socket."""
+        """Stop forwarding and remove the adapter, then close peer connections,
+        leave the lobby and close the listen socket."""
+        helper, self.helper = self.helper, None
+        if helper is not None:
+            # Waits (briefly) until the helper has removed the adapter.
+            helper.close()
         steam = self.steam
         network, self.network = self.network, None
         lobby_id, self._lobby_id = self._lobby_id, 0

@@ -112,7 +112,7 @@ class CopyField(QWidget):
 
 
 class MemberRow(QFrame):
-    """One lobby member. The empty detail column on the right is kept for later."""
+    """One lobby member, with its virtual IP address on the right."""
 
     def __init__(self):
         super().__init__()
@@ -141,8 +141,9 @@ class MemberRow(QFrame):
         column.addWidget(self.status)
         layout.addLayout(column, 1)
 
-        self.detail = label(name="memberStatus")
-        layout.addWidget(self.detail, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.address = label(name="address")
+        self.address.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.address, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def show_member(self, member: MemberView) -> None:
         self.name.setText(member.name)
@@ -150,4 +151,5 @@ class MemberRow(QFrame):
         self.host_badge.setVisible(member.is_host)
         self.you_badge.setVisible(member.is_you)
         self.status.set(member.status, member.tone)
+        self.address.setText(member.address)
         self.setToolTip(f"SteamID {member.steam_id}")

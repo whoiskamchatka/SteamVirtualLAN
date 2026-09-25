@@ -9,7 +9,14 @@ import pytest
 from steamlan.adapter import AdapterError, VirtualAdapter, WintunLoadError, ipv4, load_wintun
 from steamlan.adapter import wintun as wintun_module
 from steamlan.adapter.adapter import ADAPTER_GUID
-from steamlan.adapter.windows import MibUnicastIpAddressRow, assign_ipv4, ipv4_address_row
+from steamlan.adapter.windows import (
+    MibUnicastIpAddressRow,
+    Process,
+    ShellExecuteInfo,
+    assign_ipv4,
+    ipv4_address_row,
+    start_process,
+)
 from steamlan.adapter.wintun import (
     ERROR_ACCESS_DENIED,
     ERROR_BUFFER_OVERFLOW,
@@ -566,3 +573,101 @@ def test_official_hashes_are_pinned():
     )
     assert set(wintun_module.DLL_SHA256) == {"amd64", "arm", "arm64", "x86"}
     assert all(len(value) == 64 for value in wintun_module.DLL_SHA256.values())
+
+
+def test_shell_execute_info_layout():
+    assert ctypes.sizeof(ShellExecuteInfo) == 112
+    assert ShellExecuteInfo.nShow.offset == 48
+    assert ShellExecuteInfo.hProcess.offset == 104
+
+
+class FakeShell32:
+    def __init__(self, result=True, error=0, process=0x444):
+        self.result = result
+        self.error = error
+        self.process = process
+        self.info = None
+
+    def ShellExecuteExW(self, pointer):
+        info = pointer._obj
+        self.info = {
+            name: getattr(info, name)
+            for name in ("cbSize", "fMask", "lpVerb", "lpFile", "lpParameters", "nShow")
+        }
+        info.hProcess = self.process
+        ctypes.set_last_error(self.error)
+        return self.result
+
+
+@pytest.fixture
+def kernel32(monkeypatch):
+    kernel32 = mock.Mock()
+    kernel32.GetProcessId.return_value = 4321
+    monkeypatch.setattr("steamlan.adapter.windows._kernel32", lambda: kernel32)
+    return kernel32
+
+
+def test_start_process_elevated(kernel32):
+    shell32 = FakeShell32()
+
+    process = start_process(
+        "python.exe", ["-m", "steamlan", "--pipe", "a b"], True, shell32=shell32
+    )
+
+    assert shell32.info == {
+        "cbSize": 112,
+        "fMask": 0x40 | 0x100 | 0x400,
+        "lpVerb": "runas",
+        "lpFile": "python.exe",
+        "lpParameters": '-m steamlan --pipe "a b"',
+        "nShow": 0,
+    }
+    assert process.pid == 4321
+
+
+def test_start_process_without_elevation(kernel32):
+    shell32 = FakeShell32()
+
+    start_process("python.exe", [], False, shell32=shell32)
+
+    assert shell32.info["lpVerb"] == "open"
+
+
+def test_start_process_uac_declined(kernel32):
+    assert start_process("python.exe", [], True, shell32=FakeShell32(False, 1223)) is None
+
+
+def test_start_process_failure(kernel32):
+    with pytest.raises(AdapterError, match="could not start python.exe") as error:
+        start_process("python.exe", [], True, shell32=FakeShell32(False, 2))
+    assert error.value.winerror == 2
+
+
+def test_start_process_without_handle(kernel32):
+    with pytest.raises(AdapterError, match="without a process handle"):
+        start_process("python.exe", [], True, shell32=FakeShell32(process=0))
+
+
+def test_process_exit_code(kernel32):
+    def exit_code(handle, pointer):
+        pointer._obj.value = 3
+        return True
+
+    kernel32.WaitForSingleObject.return_value = 0
+    kernel32.GetExitCodeProcess.side_effect = exit_code
+    process = Process(0x444, kernel32)
+
+    assert process.wait(1.5) == 3
+    assert kernel32.WaitForSingleObject.call_args.args == (0x444, 1500)
+    process.close()
+    process.close()
+    kernel32.CloseHandle.assert_called_once_with(0x444)
+    with pytest.raises(ValueError):
+        process.poll()
+
+
+def test_process_still_running(kernel32):
+    kernel32.WaitForSingleObject.return_value = 0x102  # WAIT_TIMEOUT
+
+    assert Process(0x444, kernel32).poll() is None
+    assert kernel32.WaitForSingleObject.call_args.args == (0x444, 0)

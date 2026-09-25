@@ -8,7 +8,7 @@ The project is still very early in development.
 
 ## Status
 
-Nothing usable yet. Through a small internal Python binding, SteamVirtualLAN can currently initialize the Steam API, read the current user's name and SteamID, create a Steam lobby, invite a Steam friend to it and see members enter and leave. Sending data between two Steam accounts over SteamNetworkingSockets works; connecting lobby members to each other automatically is being tested.
+Nothing usable yet. The desktop app creates and joins Steam lobbies, connects the members to each other over Steam, gives every member a virtual IP address (10.77.0.x) on its own virtual network adapter and carries IPv4 packets between them. Carrying packets between two PCs has not been tested yet; broadcast and multicast (which many games use to find LAN servers) are not carried.
 
 Windows is the initial target.
 
@@ -42,7 +42,13 @@ python -m steamlan
 
 Create Lobby starts a network and shows its Lobby ID and access code. Invite Steam Friend opens the Steam overlay, where you pick friends to invite; the invite carries the lobby and access code, and the friend accepts it in Steam while the app is open on their PC. Anyone else can join with Join Lobby, using the Lobby ID and access code. The access code only exists in the host's app, in the invites it sends and with the people it is given to, and the host checks it over the Steam connection; it is never stored in the lobby.
 
-The app connects members to each other but doesn't carry any game traffic yet.
+Creating or joining a network also brings up SteamVirtualLAN's virtual network adapter (see below). Windows asks for Administrator permission for it with its UAC prompt; the app itself, with Steam and the window, keeps running without Administrator rights, and only a small helper process started through the prompt owns the adapter. If the permission is not given, the app leaves the network again and says why.
+
+The host is always 10.77.0.1. The host gives every member it admits the next free address, 10.77.0.2, 10.77.0.3 and so on, and sends all members the same list of which Steam account has which address; members never choose their own. The member list shows each member's address.
+
+Packets Windows sends to another member's address go into the adapter, through the helper to the app, and over the Steam connection to that member, whose app hands them to its own adapter and so to Windows. A member only accepts packets from the address the host gave the member that sent them, and only for its own address. Only IPv4 packets between two members' addresses are carried.
+
+Leave Lobby or closing the window first removes the adapter and ends the helper, then leaves the lobby and closes the Steam connections.
 
 ## Testing with the real Steam API
 
@@ -73,7 +79,7 @@ To let the lobby connect peers instead, start `python scripts/lobby_p2p.py guest
 
 ## Virtual network adapter
 
-SteamVirtualLAN's virtual adapter uses [Wintun](https://www.wintun.net)'s signed `wintun.dll`, which is meant to be shipped next to the application and installs its driver by itself; there is no separate installer. It isn't connected to Steam yet; for now there is a diagnostic that brings the adapter up on its own.
+SteamVirtualLAN's virtual adapter uses [Wintun](https://www.wintun.net)'s signed `wintun.dll`, which is meant to be shipped next to the application and installs its driver by itself; there is no separate installer. The desktop app sets it up by itself. There is also a diagnostic that brings the adapter up on its own, without Steam; don't run it while the app has a network open, as both use the same adapter.
 
 From the repository root:
 
@@ -81,13 +87,13 @@ From the repository root:
 python scripts/check_adapter.py --reply
 ```
 
-The first time, the script downloads the official Wintun 0.14.1 package from wintun.net, checks it against its published SHA-256 and keeps only the `wintun.dll` for your CPU in the ignored `wintun` directory; nothing unverified is ever loaded. The adapter needs Administrator rights, so the script then asks for them through Windows' UAC prompt and continues in a new window. There it creates an adapter named SteamVirtualLAN with the address 10.77.0.1/24 (no gateway or DNS; no other adapter or setting is changed) and prints each packet Windows sends into it. In a second terminal run:
+The first time, the script (like the app) downloads the official Wintun 0.14.1 package from wintun.net, checks it against its published SHA-256 and keeps only the `wintun.dll` for your CPU in the ignored `wintun` directory; nothing unverified is ever loaded. The adapter needs Administrator rights, so the script then asks for them through Windows' UAC prompt and continues in a new window. There it creates an adapter named SteamVirtualLAN with the address 10.77.0.1/24 (no gateway or DNS; no other adapter or setting is changed) and prints each packet Windows sends into it. In a second terminal run:
 
 ```powershell
 ping 10.77.0.2
 ```
 
-The diagnostic should print `IPv4 ICMP 10.77.0.1 -> 10.77.0.2` for every ping. With `--reply` it also answers them, so ping should show replies from 10.77.0.2. Stop it with Ctrl+C; the adapter is removed when it stops. `--remove-driver` also uninstalls Wintun's driver afterwards if nothing else uses it.
+The diagnostic should print `IPv4 ICMP 10.77.0.1 -> 10.77.0.2` for every ping. With `--reply` it also answers them itself, so ping should show replies from 10.77.0.2 (the app never does this; there, replies come from the other PC). Stop it with Ctrl+C; the adapter is removed when it stops. `--remove-driver` also uninstalls Wintun's driver afterwards if nothing else uses it.
 
 ## Disclaimer
 

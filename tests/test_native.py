@@ -13,6 +13,7 @@ from steamlan.steam.native import (
     LOBBY_ENTER,
     NET_HANDLE_INVALID,
     SEND_RELIABLE,
+    SEND_UNRELIABLE_NO_NAGLE,
     CallbackMsg,
     ChatMemberStateChange,
     ChatRoomEnterResponse,
@@ -326,6 +327,7 @@ def test_networking_message_layout():
 def test_networking_constants():
     assert NET_HANDLE_INVALID == 0
     assert SEND_RELIABLE == 8
+    assert SEND_UNRELIABLE_NO_NAGLE == 1
     assert (EResult.OK, EResult.INVALID_PARAM, EResult.INVALID_STATE, EResult.IGNORED) == (
         1,
         8,

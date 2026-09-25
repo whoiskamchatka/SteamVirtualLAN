@@ -1,3 +1,5 @@
+from ipaddress import IPv4Address
+
 import pytest
 
 from steamlan.app import access
@@ -60,10 +62,20 @@ def test_messages_round_trip():
     assert access.parse_message(access.auth_message("")) == access.Message("auth", code="")
     assert access.parse_message(access.ACCEPTED) == access.Message("accepted")
     assert access.parse_message(access.DENIED) == access.Message("denied")
-    assert access.parse_message(access.members_message([USER + 1, USER])) == access.Message(
-        "members", members=(USER, USER + 1)
+    addresses = {USER + 1: IPv4Address("10.77.0.2"), USER: IPv4Address("10.77.0.1")}
+    members = access.parse_message(access.members_message(addresses))
+    assert members == access.Message(
+        "members",
+        addresses=((USER, IPv4Address("10.77.0.1")), (USER + 1, IPv4Address("10.77.0.2"))),
     )
-    assert access.parse_message(access.members_message([])) == access.Message("members")
+    assert members.members == (USER, USER + 1)
+    assert access.parse_message(access.members_message({})) == access.Message("members")
+
+
+def test_members_message_format():
+    message = access.members_message({USER: IPv4Address("10.77.0.1")})
+
+    assert message == f"SVL1 MEMBERS {USER}=10.77.0.1".encode()
 
 
 @pytest.mark.parametrize(
@@ -76,6 +88,14 @@ def test_messages_round_trip():
         b"SVL1 MEMBERS 1,x",
         b"SVL1 MEMBERS -5",
         b"SVL1 MEMBERS " + str(2**64).encode(),
+        b"SVL1 MEMBERS 5",
+        b"SVL1 MEMBERS 5=10.77.0.x",
+        b"SVL1 MEMBERS 5=192.168.1.2",
+        b"SVL1 MEMBERS 5=10.77.0.0",
+        b"SVL1 MEMBERS 5=10.77.0.255",
+        b"SVL1 MEMBERS 0=10.77.0.2",
+        b"SVL1 MEMBERS 5=10.77.0.2,5=10.77.0.3",
+        b"SVL1 MEMBERS 5=10.77.0.2,6=10.77.0.2",
         b"SVL2 OK",
     ],
 )

@@ -81,8 +81,8 @@ class FakeSteam:
         self.closed.append(connection)
         return True
 
-    def send_message(self, connection, data):
-        self.sent.append((connection, data))
+    def send_message(self, connection, data, reliable=True):
+        self.sent.append((connection, data) if reliable else (connection, data, "unreliable"))
 
     def receive_messages(self, connection):
         return self.inbox.pop(connection, [])
@@ -368,8 +368,9 @@ def test_send_to_connected_peer():
     s.poll()
 
     s.send(HIGH, b"payload")
+    s.send(HIGH, b"packet", reliable=False)
 
-    assert steam.sent == [(101, b"payload")]
+    assert steam.sent == [(101, b"payload"), (101, b"packet", "unreliable")]
 
 
 def test_send_to_unknown_peer():

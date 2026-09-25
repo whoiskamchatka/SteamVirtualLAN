@@ -33,6 +33,7 @@ QLabel#notice {{ color: {OK}; }}
 QLabel#value {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }}
 QLabel#memberName {{ font-weight: 600; }}
 QLabel#memberStatus {{ color: {MUTED}; font-size: 12px; }}
+QLabel#address {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }}
 QLabel#avatar {{
     background: {RAISED}; color: {MUTED}; border-radius: 16px;
     font-weight: 600; qproperty-alignment: AlignCenter;

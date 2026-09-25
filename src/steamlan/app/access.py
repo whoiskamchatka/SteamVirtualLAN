@@ -11,6 +11,9 @@ encrypts and authenticates, and the host checks it.
 import hmac
 import secrets
 from dataclasses import dataclass
+from ipaddress import IPv4Address
+
+from steamlan.adapter.ipv4 import is_member_address
 
 # Crockford's base32: no I, L, O or U, so codes survive being read aloud.
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -82,24 +85,54 @@ def parse_invite_connect_string(text: str) -> tuple[int, str]:
     return parse_lobby_id(lobby_text), normalize_access_code(code)
 
 
-_PREFIX = b"SVL1 "
-ACCEPTED = _PREFIX + b"OK"
-DENIED = _PREFIX + b"DENIED"
+# Every control message starts with PREFIX. Control messages are only ever
+# parsed here; IP packets travel in their own kind of message (tunnel.py).
+PREFIX = b"SVL1 "
+ACCEPTED = PREFIX + b"OK"
+DENIED = PREFIX + b"DENIED"
 
 
 @dataclass(frozen=True)
 class Message:
     kind: str  # "auth", "accepted", "denied" or "members"
     code: str = ""
-    members: tuple[int, ...] = ()
+    # "members": the host and the members it admitted, each with the virtual
+    # IP address the host gave it, as (steam_id, address) sorted by SteamID.
+    addresses: tuple[tuple[int, IPv4Address], ...] = ()
+
+    @property
+    def members(self) -> tuple[int, ...]:
+        return tuple(steam_id for steam_id, _ in self.addresses)
 
 
 def auth_message(code: str) -> bytes:
-    return _PREFIX + b"AUTH " + code.encode()
+    return PREFIX + b"AUTH " + code.encode()
 
 
-def members_message(members: list[int]) -> bytes:
-    return _PREFIX + b"MEMBERS " + ",".join(str(steam_id) for steam_id in sorted(members)).encode()
+def members_message(addresses: dict[int, IPv4Address]) -> bytes:
+    entries = ",".join(f"{steam_id}={address}" for steam_id, address in sorted(addresses.items()))
+    return PREFIX + b"MEMBERS " + entries.encode()
+
+
+def _parse_addresses(text: str) -> tuple[tuple[int, IPv4Address], ...] | None:
+    addresses = []
+    for part in text.split(","):
+        if not part:
+            continue
+        steam_text, separator, address_text = part.partition("=")
+        try:
+            steam_id = _parse_id(steam_text)
+            address = IPv4Address(address_text)
+        except ValueError:
+            return None
+        if not separator or not is_member_address(address):
+            return None
+        addresses.append((steam_id, address))
+    steam_ids = [steam_id for steam_id, _ in addresses]
+    unique_addresses = {address for _, address in addresses}
+    if len(set(steam_ids)) != len(addresses) or len(unique_addresses) != len(addresses):
+        return None
+    return tuple(sorted(addresses))
 
 
 def parse_message(data: bytes) -> Message | None:
@@ -108,17 +141,14 @@ def parse_message(data: bytes) -> Message | None:
         return Message("accepted")
     if data == DENIED:
         return Message("denied")
-    if data.startswith(_PREFIX + b"AUTH "):
-        code = data[len(_PREFIX) + 5 :]
+    if data.startswith(PREFIX + b"AUTH "):
+        code = data[len(PREFIX) + 5 :]
         if len(code) <= CODE_LENGTH and code.isascii():
             return Message("auth", code=code.decode())
         return None
-    if data.startswith(_PREFIX + b"MEMBERS "):
-        text = data[len(_PREFIX) + 8 :].decode("ascii", errors="replace")
-        try:
-            members = tuple(int(part) for part in text.split(",") if part)
-        except ValueError:
-            return None
-        if all(0 < steam_id < 2**64 for steam_id in members):
-            return Message("members", members=members)
+    if data.startswith(PREFIX + b"MEMBERS "):
+        text = data[len(PREFIX) + 8 :].decode("ascii", errors="replace")
+        addresses = _parse_addresses(text)
+        if addresses is not None:
+            return Message("members", addresses=addresses)
     return None

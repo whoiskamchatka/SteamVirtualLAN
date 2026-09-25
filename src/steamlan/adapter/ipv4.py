@@ -1,9 +1,21 @@
-"""Just enough of the IPv4 header to describe packets in diagnostics."""
+"""The virtual network's addresses, and just enough of the IPv4 header to route packets."""
 
 import ipaddress
 from dataclasses import dataclass
 
 PROTOCOLS = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP"}
+
+# Every SteamVirtualLAN network uses this subnet. The host is always .1.
+VIRTUAL_NETWORK = ipaddress.IPv4Network("10.77.0.0/24")
+HOST_ADDRESS = VIRTUAL_NETWORK[1]
+
+
+def is_member_address(address: ipaddress.IPv4Address) -> bool:
+    """Whether address can belong to a member: in the subnet, not its network or broadcast."""
+    return address in VIRTUAL_NETWORK and address not in (
+        VIRTUAL_NETWORK.network_address,
+        VIRTUAL_NETWORK.broadcast_address,
+    )
 
 
 @dataclass(frozen=True)

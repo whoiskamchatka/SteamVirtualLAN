@@ -74,11 +74,11 @@ class LobbySession:
         self._connect()
         return self._receive()
 
-    def send(self, steam_id: int, data: bytes) -> None:
+    def send(self, steam_id: int, data: bytes, reliable: bool = True) -> None:
         peer = self.peers.get(steam_id)
         if peer is None or not peer.connected:
             raise SteamError(f"not connected to {steam_id}")
-        self.steam.send_message(peer.connection, data)
+        self.steam.send_message(peer.connection, data, reliable=reliable)
 
     def disconnect(self, steam_id: int, reason: str, linger: bool = False) -> None:
         """Close the connection to a peer and don't connect to it again."""

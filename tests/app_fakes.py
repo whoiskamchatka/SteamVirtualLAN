@@ -1,5 +1,7 @@
 """A fake SteamClient for the app tests, with helpers for the callbacks it returns."""
 
+from ipaddress import IPv4Address
+
 from steamlan.steam import ChatMemberStateChange, ConnectionState, SteamCallback, SteamError
 from steamlan.steam.native import (
     CONNECTION_STATUS_CHANGED,
@@ -28,6 +30,18 @@ OTHER_LOBBY = LOBBY + 1
 LISTEN_SOCKET = 0x55
 CREATE_CALL = 900
 JOIN_CALL = 901
+
+
+def ipv4_packet(source, destination, payload=b"ping", protocol=1):
+    """A minimal IPv4 packet; the header checksum is not needed by anything here."""
+    header = bytearray(20)
+    header[0] = 0x45
+    header[2:4] = (20 + len(payload)).to_bytes(2, "big")
+    header[8] = 128
+    header[9] = protocol
+    header[12:16] = IPv4Address(source).packed
+    header[16:20] = IPv4Address(destination).packed
+    return bytes(header) + payload
 
 
 def status(connection, state, remote, listen_socket=0):
@@ -86,6 +100,8 @@ class FakeSteam:
         self.next_connection = 100
         self.calls = []
         self.sent = []
+        # Messages sent unreliably: the IP packets.
+        self.unreliable = []
         self.closed = []
         self.fail = set()
         self.running = True
@@ -153,11 +169,12 @@ class FakeSteam:
         self._record("accept_connection", connection)
 
     def close_connection(self, connection, debug="", linger=False):
+        self.calls.append(("close_connection", connection))
         self.closed.append((connection, linger))
         return True
 
-    def send_message(self, connection, data):
-        self.sent.append((connection, data))
+    def send_message(self, connection, data, reliable=True):
+        (self.sent if reliable else self.unreliable).append((connection, data))
 
     def receive_messages(self, connection):
         return self.inbox.pop(connection, [])
@@ -168,3 +185,59 @@ class FakeSteam:
 
     def called(self, name):
         return [call[1:] for call in self.calls if call[0] == name]
+
+
+class FakeHelper:
+    """Stands in for AdapterHelper: no UAC prompt, helper process or adapter.
+
+    Tests move it along with become_ready() and fail(). Steps that matter for
+    ordering are recorded in steam.calls, next to the Steam calls.
+    """
+
+    def __init__(self, steam):
+        from steamlan.adapter.launcher import State
+
+        self.State = State
+        self.steam = steam
+        self.state = State.IDLE
+        self.progress = ""
+        self.error = ""
+        self.address = None
+        self.requested = []
+        self.from_windows = []
+        self.to_windows = []
+
+    @property
+    def ready(self):
+        return self.state is self.State.READY
+
+    def start(self):
+        self.steam.calls.append(("helper_start",))
+        self.state = self.State.STARTING
+        self.progress = "Waiting for Administrator permission..."
+
+    def become_ready(self):
+        self.state = self.State.READY
+        self.progress = ""
+
+    def fail(self, error):
+        self.state = self.State.FAILED
+        self.error = error
+
+    def poll(self):
+        packets, self.from_windows = self.from_windows, []
+        return packets
+
+    def set_address(self, address):
+        if self.ready and address not in self.requested:
+            self.requested.append(address)
+            # The real helper confirms a little later, through poll().
+            self.address = address
+
+    def send_packet(self, packet):
+        if self.ready and self.address is not None:
+            self.to_windows.append(packet)
+
+    def close(self):
+        self.steam.calls.append(("helper_close",))
+        self.state = self.State.STOPPED

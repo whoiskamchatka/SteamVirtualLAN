@@ -11,6 +11,7 @@ from steamlan.steam.native import (
     LOBBY_ENTER,
     NET_HANDLE_INVALID,
     SEND_RELIABLE,
+    SEND_UNRELIABLE_NO_NAGLE,
     STEAM_API_CALL_COMPLETED,
     CallbackMsg,
     ChatRoomEnterResponse,
@@ -384,12 +385,13 @@ class SteamClient:
             self._sockets(lib), connection, 0, debug.encode(), linger
         )
 
-    def send_message(self, connection: int, data: bytes) -> None:
-        """Send data as one reliable message."""
+    def send_message(self, connection: int, data: bytes, reliable: bool = True) -> None:
+        """Send data as one message: reliable, or unreliable and without delay."""
         lib = self._running_lib()
         data = bytes(data)
+        flags = SEND_RELIABLE if reliable else SEND_UNRELIABLE_NO_NAGLE
         result = lib.SteamAPI_ISteamNetworkingSockets_SendMessageToConnection(
-            self._sockets(lib), connection, data, len(data), SEND_RELIABLE, None
+            self._sockets(lib), connection, data, len(data), flags, None
         )
         _check_result(result, "SendMessageToConnection")
 

@@ -154,6 +154,12 @@ class LobbyPage(QWidget):
         details_layout.addWidget(self.code_divider)
         self.access_code = CopyField("Access code")
         details_layout.addWidget(self.access_code)
+        self.adapter_divider = divider()
+        details_layout.addWidget(self.adapter_divider)
+        self.adapter_caption = label("VIRTUAL NETWORK", "caption")
+        details_layout.addWidget(self.adapter_caption)
+        self.adapter_status = StatusLine()
+        details_layout.addWidget(self.adapter_status)
         layout.addWidget(details)
 
         members_header = QHBoxLayout()
@@ -195,6 +201,9 @@ class LobbyPage(QWidget):
         self.access_code.set_value(view.access_code)
         self.access_code.setVisible(bool(view.access_code))
         self.code_divider.setVisible(bool(view.access_code))
+        self.adapter_status.set(view.adapter_status, view.adapter_tone)
+        for widget in (self.adapter_divider, self.adapter_caption, self.adapter_status):
+            widget.setVisible(bool(view.adapter_status))
         self.invite_button.setVisible(view.is_host)
         self.member_count.setText(str(len(view.members)))
 

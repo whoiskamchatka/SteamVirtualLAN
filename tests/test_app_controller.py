@@ -1,3 +1,5 @@
+from ipaddress import IPv4Address
+
 import pytest
 from app_fakes import (
     CREATE_CALL,
@@ -5,15 +7,18 @@ from app_fakes import (
     HOST,
     LISTEN_SOCKET,
     LOBBY,
+    FakeHelper,
     FakeSteam,
     invite_accepted,
+    ipv4_packet,
     join_requested,
     lobby_created,
     lobby_entered,
     status,
 )
 
-from steamlan.app import access
+from steamlan.adapter.launcher import UAC_DECLINED
+from steamlan.app import access, tunnel
 from steamlan.app.controller import CALL_TIMEOUT, AppController, Screen
 from steamlan.steam import ConnectionState, SteamCallback, SteamInitError
 from steamlan.steam.native import ChatRoomEnterResponse, EResult
@@ -30,7 +35,14 @@ class Clock:
 
 
 def started(steam, clock=None):
-    controller = AppController(lambda: steam, clock or Clock())
+    helpers = []
+
+    def make_helper():
+        helpers.append(FakeHelper(steam))
+        return helpers[-1]
+
+    controller = AppController(lambda: steam, clock or Clock(), make_helper)
+    controller.helpers = helpers
     controller.start()
     return controller
 
@@ -391,3 +403,204 @@ def test_overlay_needs_present():
 
     controller.shutdown()
     assert controller.overlay_needs_present() is False
+
+
+A1 = IPv4Address("10.77.0.1")
+A2 = IPv4Address("10.77.0.2")
+
+
+def order(steam):
+    """The cleanup steps in the order they happened."""
+    steps = ("helper_close", "close_connection", "leave_lobby", "close_listen_socket", "close")
+    return [call[0] for call in steam.calls if call[0] in steps]
+
+
+def host_with_guest():
+    """A host whose adapter is ready and whose guest has been admitted."""
+    steam, controller = host_in_lobby(FakeSteam(HOST, [HOST, GUEST]))
+    controller.tick()
+    (connection,) = [call[1] for call in steam.called("connect_p2p") if call[0] == GUEST]
+    steam.frames = [[status(connection, ConnectionState.CONNECTED, GUEST)]]
+    controller.tick()
+    steam.inbox[connection] = [access.auth_message(controller.network.access_code)]
+    controller.tick()
+    controller.helper.become_ready()
+    controller.tick()
+    return steam, controller, connection
+
+
+def test_entering_a_network_starts_the_adapter_helper():
+    steam, controller = host_in_lobby()
+
+    (helper,) = controller.helpers
+    assert controller.helper is helper
+    assert helper.state is helper.State.STARTING
+    view = controller.view()
+    assert view.screen is Screen.LOBBY
+    assert (view.adapter_status, view.adapter_tone) == (
+        "Waiting for Administrator permission...",
+        "pending",
+    )
+
+
+def test_joining_starts_the_adapter_helper():
+    steam, controller = guest_joining()
+
+    assert len(controller.helpers) == 1
+    assert controller.helper.state is controller.helper.State.STARTING
+
+
+def test_failed_join_starts_no_helper():
+    steam, controller = guest_joining(response=ChatRoomEnterResponse.DOESNT_EXIST)
+
+    assert controller.helpers == []
+
+
+def test_host_adapter_gets_the_host_address():
+    steam, controller = host_in_lobby()
+    controller.helper.become_ready()
+
+    controller.tick()
+
+    assert controller.helper.requested == [A1]
+    view = controller.view()
+    assert (view.adapter_status, view.adapter_tone) == ("Virtual network ready: 10.77.0.1", "ok")
+    assert view.members[0].address == "10.77.0.1"
+
+
+def test_guest_adapter_waits_for_the_host_to_assign_an_address():
+    steam, controller = guest_joining()
+    controller.helper.become_ready()
+    steam.frames = [
+        [status(7, ConnectionState.CONNECTING, HOST, LISTEN_SOCKET)],
+        [status(7, ConnectionState.CONNECTED, HOST, LISTEN_SOCKET)],
+    ]
+    controller.tick()
+    controller.tick()
+
+    assert controller.helper.requested == []
+    assert controller.view().adapter_status == "Waiting for the host to assign an address"
+
+    steam.inbox[7] = [access.ACCEPTED, access.members_message({HOST: A1, GUEST: A2})]
+    controller.tick()
+
+    assert controller.helper.requested == [A2]
+    view = controller.view()
+    assert view.adapter_status == "Virtual network ready: 10.77.0.2"
+    assert {member.steam_id: member.address for member in view.members} == {
+        HOST: "10.77.0.1",
+        GUEST: "10.77.0.2",
+    }
+
+
+def test_packets_from_windows_go_to_the_member_that_owns_the_address():
+    steam, controller, connection = host_with_guest()
+    packet = ipv4_packet(A1, A2)
+    controller.helper.from_windows = [packet, ipv4_packet(A1, "10.77.0.9")]
+
+    controller.tick()
+
+    assert steam.unreliable == [(connection, tunnel.packet_message(packet))]
+
+
+def test_packets_from_members_go_to_windows():
+    steam, controller, connection = host_with_guest()
+    packet = ipv4_packet(A2, A1, b"reply")
+    steam.inbox[connection] = [tunnel.packet_message(packet)]
+
+    controller.tick()
+
+    assert controller.helper.to_windows == [packet]
+
+
+def test_packets_before_the_adapter_is_ready_are_dropped():
+    steam, controller, connection = host_with_guest()
+    controller.helper.state = controller.helper.State.STARTING
+    steam.inbox[connection] = [tunnel.packet_message(ipv4_packet(A2, A1))]
+    controller.tick()
+
+    controller.helper.become_ready()
+    controller.tick()
+
+    assert controller.helper.to_windows == []
+    assert controller.network.take_packets() == []
+
+
+def test_leave_removes_the_adapter_before_leaving_steam():
+    steam, controller, connection = host_with_guest()
+    helper = controller.helper
+
+    controller.leave()
+
+    assert helper.state is helper.State.STOPPED
+    assert controller.helper is None
+    assert order(steam) == [
+        "helper_close",
+        "close_connection",
+        "leave_lobby",
+        "close_listen_socket",
+    ]
+
+
+def test_shutdown_removes_the_adapter_then_cleans_up_steam():
+    steam, controller, connection = host_with_guest()
+
+    controller.shutdown()
+    controller.shutdown()
+
+    assert order(steam) == [
+        "helper_close",
+        "close_connection",
+        "leave_lobby",
+        "close_listen_socket",
+        "close",
+    ]
+
+
+def test_declined_uac_prompt_leaves_the_network():
+    steam, controller = host_in_lobby()
+    controller.helper.fail(UAC_DECLINED)
+
+    controller.tick()
+
+    view = controller.view()
+    assert (view.screen, view.error) == (Screen.HOME, UAC_DECLINED)
+    assert controller.network is None and controller.helper is None
+    assert order(steam) == ["helper_close", "leave_lobby", "close_listen_socket"]
+    # Nothing is left behind, and a new network can be created.
+    controller.create_lobby()
+    assert controller.view().busy == "Creating lobby..."
+
+
+def test_adapter_failure_sends_a_member_back_to_the_join_form():
+    steam, controller = guest_joining()
+    controller.helper.become_ready()
+    controller.helper.fail("The virtual network helper stopped unexpectedly")
+
+    controller.tick()
+
+    view = controller.view()
+    assert (view.screen, view.error) == (
+        Screen.JOIN,
+        "The virtual network helper stopped unexpectedly",
+    )
+    assert steam.called("leave_lobby") == [(LOBBY,)]
+
+
+def test_helper_that_cannot_start_leaves_the_network():
+    steam = FakeSteam(HOST)
+
+    class BrokenHelper(FakeHelper):
+        def start(self):
+            raise OSError("no pipe")
+
+    controller = AppController(lambda: steam, Clock(), lambda: BrokenHelper(steam))
+    controller.start()
+    controller.create_lobby()
+    steam.frames = [[lobby_created()]]
+
+    controller.tick()
+
+    view = controller.view()
+    assert (view.screen, view.error) == (Screen.HOME, "Could not start the virtual network")
+    assert order(steam) == ["helper_close", "leave_lobby", "close_listen_socket"]

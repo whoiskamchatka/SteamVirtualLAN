@@ -14,8 +14,8 @@ from steamlan.gui.window import MainWindow  # noqa: E402
 
 LOBBY = 109775240917097000
 MEMBERS = (
-    MemberView(1, "Host", False, True, "Connected", "ok"),
-    MemberView(2, "Me", True, False, "Connected", "ok"),
+    MemberView(1, "Host", False, True, "Connected", "ok", "10.77.0.1"),
+    MemberView(2, "Me", True, False, "Connected", "ok", "10.77.0.2"),
 )
 
 
@@ -93,6 +93,7 @@ def test_every_screen_renders(window):
 
     member_view = View(Screen.LOBBY, True, "", "ok", lobby_id=LOBBY, members=MEMBERS[:1])
     show(window, controller, member_view)
+    assert window.lobby.adapter_status.isHidden()
     assert window.lobby.access_code.isHidden()
     assert window.lobby.invite_button.isHidden()
     assert len(window.lobby._rows) == 1
@@ -169,3 +170,37 @@ def test_invite_failure_is_shown(window):
 
     assert window.lobby.notice.text() == "The Steam overlay isn't available."
     assert window.lobby.notice.objectName() == "error"
+
+
+def test_members_show_their_virtual_addresses(window):
+    window, controller = window
+    view = View(
+        Screen.LOBBY,
+        True,
+        "",
+        "ok",
+        lobby_id=LOBBY,
+        is_host=True,
+        adapter_status="Virtual network ready: 10.77.0.1",
+        adapter_tone="ok",
+        members=MEMBERS,
+    )
+
+    show(window, controller, view)
+
+    rows = window.lobby._rows
+    assert rows[1].address.text() == "10.77.0.1"
+    assert rows[2].address.text() == "10.77.0.2"
+    assert not rows[1].host_badge.isHidden()
+    assert not rows[2].you_badge.isHidden()
+    assert not window.lobby.adapter_status.isHidden()
+    assert window.lobby.adapter_status.text.text() == "Virtual network ready: 10.77.0.1"
+
+
+def test_member_without_an_address_yet(window):
+    window, controller = window
+    waiting = (MemberView(3, "Friend", False, False, "Connecting", "pending"),)
+
+    show(window, controller, View(Screen.LOBBY, True, "", "ok", lobby_id=LOBBY, members=waiting))
+
+    assert window.lobby._rows[3].address.text() == ""

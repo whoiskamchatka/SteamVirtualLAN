@@ -61,7 +61,7 @@ class FakeSteam:
     def accept_connection(self, connection):
         self.accepted.append(connection)
 
-    def send_message(self, connection, data):
+    def send_message(self, connection, data, reliable=True):
         self.sent.append((connection, data))
 
     def receive_messages(self, connection):
@@ -382,7 +382,7 @@ class LinkedSteam:
             status(theirs, ConnectionState.CONNECTED, 0, self.steam_id)
         )
 
-    def send_message(self, connection, data):
+    def send_message(self, connection, data, reliable=True):
         remote, theirs = self.network.links[(self.steam_id, connection)]
         self.network.clients[remote].inbox.setdefault(theirs, []).append(data)
 

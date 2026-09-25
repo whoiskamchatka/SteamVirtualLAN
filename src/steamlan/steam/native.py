@@ -228,6 +228,9 @@ CONNECTION_STATUS_CHANGED = 1221
 NET_HANDLE_INVALID = 0
 
 SEND_RELIABLE = 8  # k_nSteamNetworkingSend_Reliable
+# k_nSteamNetworkingSend_UnreliableNoNagle: may be dropped, and sent right away
+# instead of waiting to be combined with later messages.
+SEND_UNRELIABLE_NO_NAGLE = 1
 
 
 # Declared outside any #pragma pack, so it uses the default x64 layout. Steam
