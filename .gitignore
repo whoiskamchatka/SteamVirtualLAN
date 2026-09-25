@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Steamworks SDK and redistributables (never commit Valve files)
+sdk/
+steamworks_sdk*/
+steamworks_sdk*.zip
+steam_api*.lib
+libsteam_api.so
+libsteam_api.dylib
+*.dll
+steam_appid.txt
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
