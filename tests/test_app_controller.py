@@ -18,6 +18,7 @@ from app_fakes import (
     join_requested,
     lobby_created,
     lobby_entered,
+    member_update,
     status,
 )
 
@@ -34,8 +35,8 @@ from steamlan.app.controller import (
     Screen,
 )
 from steamlan.app.state import SavedNetwork, StateStore
-from steamlan.steam import ConnectionState, SteamCallback, SteamInitError
-from steamlan.steam.native import ChatRoomEnterResponse, EResult
+from steamlan.steam import ChatMemberStateChange, ConnectionState, SteamCallback, SteamInitError
+from steamlan.steam.native import STEAM_SERVERS_DISCONNECTED, ChatRoomEnterResponse, EResult
 
 CODE = "7K2QDM9XTE"
 CODE_TEXT = "7K2QD-M9XTE"
@@ -955,18 +956,96 @@ def test_losing_steam_keeps_the_lobby_the_adapter_and_the_roster(store):
     assert controller.helper is helper and len(controller.helpers) == 1
 
 
-def test_leaving_the_lobby_by_accident_is_a_lost_connection():
+def undisturbed(steam, controller, helper):
+    assert controller.presence() is Presence.ONLINE
+    assert controller.link is None
+    assert not controller.network.suspended
+    assert controller.helper is helper and len(controller.helpers) == 1
+    assert steam.called("request_join_lobby") == []
+    assert steam.called("leave_lobby") == []
+
+
+def test_peer_closing_its_connection_is_not_a_lost_connection():
+    steam, controller, connection = creator_with_member()
+    helper = controller.helper
+
+    steam.frames = [[status(connection, ConnectionState.CLOSED_BY_PEER, GUEST)]]
+    for _ in range(5):
+        controller.tick()
+
+    undisturbed(steam, controller, helper)
+    assert {m.steam_id: m.status for m in controller.view().members}[GUEST] == "Reconnecting..."
+
+
+@pytest.mark.parametrize("change", [ChatMemberStateChange.LEFT, ChatMemberStateChange.DISCONNECTED])
+def test_peer_leaving_the_lobby_is_not_a_lost_connection(change):
+    steam, controller, connection = creator_with_member()
+    helper = controller.helper
+
+    steam.members.remove(GUEST)
+    steam.frames = [
+        [status(connection, ConnectionState.CLOSED_BY_PEER, GUEST)],
+        [member_update(GUEST, change)],
+    ]
+    for _ in range(5):
+        controller.tick()
+
+    undisturbed(steam, controller, helper)
+    status_text = {m.steam_id: m.status for m in controller.view().members}[GUEST]
+    assert status_text == ("Offline" if change is ChatMemberStateChange.LEFT else "Lost connection")
+    assert controller.saved.address_of(GUEST) == A2
+
+
+def test_unreadable_or_odd_lobby_snapshots_are_not_a_lost_connection():
+    steam, controller, connection = creator_with_member()
+    helper = controller.helper
+
+    # Steam's copy of the lobby mid-update: no members, then no owner.
+    steam.members = []
+    controller.tick()
+    steam.owner = 0
+    controller.tick()
+    steam.members, steam.owner = [HOST, GUEST], HOST
+    controller.tick()
+
+    undisturbed(steam, controller, helper)
+    # Nothing was concluded about the peer from those reads.
+    assert controller.network.lobby.peers[GUEST].connected
+
+
+def test_steam_taking_this_pc_out_of_the_lobby_is_a_lost_connection():
     steam, controller = creator()
     controller.tick()
 
     steam.members = []
+    steam.frames = [[member_update(HOST, ChatMemberStateChange.DISCONNECTED)]]
     controller.tick()
     assert controller.link is Link.RESTORING_NETWORK
+    assert controller.view().overlay == "Restoring connection..."
     assert controller.view().overlay_detail == "Rejoining your network..."
-    controller.tick()
 
+    steam.owner = 0
+    controller.tick()
     assert steam.called("request_join_lobby") == [(LOBBY,)]
     assert steam.called("leave_lobby") == []
+
+
+def test_a_short_steam_outage_is_noticed_even_if_it_is_over():
+    steam, controller = creator()
+    controller.tick()
+    helper = controller.helper
+
+    # Steam lost and got back its servers between two ticks.
+    steam.frames = [[SteamCallback(STEAM_SERVERS_DISCONNECTED, bytes(4))]]
+    controller.tick()
+    assert controller.presence() is Presence.RESTORING
+
+    controller.tick()
+
+    # Still in the lobby: carried on without joining it again.
+    assert controller.presence() is Presence.ONLINE
+    assert steam.called("request_join_lobby") == []
+    assert controller.helper is helper
 
 
 def test_network_that_no_longer_knows_this_member_is_forgotten(store):

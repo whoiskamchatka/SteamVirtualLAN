@@ -51,6 +51,11 @@ class World:
         # Which remaining member Steam makes the owner; by default the one that
         # has been in the lobby longest.
         self.pick_owner = pick_owner or (lambda lobby: lobby.members[0])
+        # After a member leaves, how many member-list reads on each remaining
+        # member fail, while Steam's local copy of the lobby is still being
+        # updated: its member count and its entries don't agree yet, which
+        # SteamClient.lobby_members reports as a SteamError.
+        self.unsettled_reads = 0
 
     def handle(self) -> int:
         self.next_handle += 1
@@ -78,6 +83,7 @@ class World:
             lobby.owner = self.pick_owner(lobby)
         for member in lobby.members:
             self.clients[member].queue.append(member_update(steam_id, change, lobby_id))
+            self.clients[member].unsettled_reads = self.unsettled_reads
 
 
 class SimSteam:
@@ -98,6 +104,7 @@ class SimSteam:
         self.logged_on = True
         # Steam answers every JoinLobby with k_EChatRoomEnterResponseError.
         self.fail_joins = False
+        self.unsettled_reads = 0
 
     # Callbacks
 
@@ -129,6 +136,10 @@ class SimSteam:
         if lobby is None:
             self.queue.append(lobby_entered(ChatRoomEnterResponse.DOESNT_EXIST, lobby_id, api_call))
             return api_call
+        if self.steam_id in lobby.members:
+            # Already in it: nothing changes.
+            self.queue.append(lobby_entered(lobby_id=lobby_id, api_call=api_call))
+            return api_call
         for member in lobby.members:
             self.world.clients[member].queue.append(member_update(self.steam_id, lobby_id=lobby_id))
         lobby.members.append(self.steam_id)
@@ -154,6 +165,9 @@ class SimSteam:
             raise SteamError("Steam returned no lobby owner") from None
 
     def lobby_members(self, lobby_id):
+        if self.unsettled_reads:
+            self.unsettled_reads -= 1
+            raise SteamError("Steam returned an empty SteamID for a lobby member")
         lobby = self.world.lobbies.get(lobby_id)
         if lobby is None or self.steam_id not in lobby.members:
             return []

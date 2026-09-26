@@ -12,11 +12,15 @@ remembers between runs (state.py). In a network, this PC is:
 Leave Network is the only way out of a network: it tells the network so that
 the address is freed, and forgets the network.
 
-Losing the connection by accident is different from going offline. When this
-PC can't reach Steam any more (ISteamUser::BLoggedOn), or finds itself no
-longer in the network's lobby, it doesn't know anything about the other
-members, so it doesn't conclude anything: the member list stays as it was last
-seen, behind a "Restoring connection..." overlay, and the adapter stays up.
+Losing the connection by accident is different from going offline. Only this
+PC's own Steam client can say that this PC lost its connection: it isn't
+logged on to Steam any more (ISteamUser::BLoggedOn), it reports that it lost
+the Steam servers (SteamServersDisconnected_t), or it reports this PC itself
+leaving the network's lobby. What happens to other members (their connection
+closing, them leaving the lobby, the owner changing, nobody else being left)
+never counts. After a loss this PC knows nothing about the other members, so
+it doesn't conclude anything: the member list stays as it was last seen,
+behind a "Restoring connection..." overlay, and the adapter stays up.
 
     online --(connection lost)--> RECONNECTING --(Steam back)--> RESTORING_NETWORK
     RESTORING_NETWORK --(in the lobby again)--> online
@@ -41,8 +45,10 @@ from steamlan.app.network import NO_MEMBERS_ONLINE, MemberView, NetworkSession
 from steamlan.app.state import SavedNetwork, StateStore
 from steamlan.app.steamworks import open_steam
 from steamlan.steam import (
+    ChatMemberStateChange,
     ConnectStringJoinRequest,
     LobbyJoinRequest,
+    LobbyMemberUpdate,
     SteamAPILoadError,
     SteamClient,
     SteamError,
@@ -50,6 +56,7 @@ from steamlan.steam import (
     decode_lobby_event,
 )
 from steamlan.steam.client import read_lobby_created, read_lobby_enter
+from steamlan.steam.native import STEAM_SERVERS_DISCONNECTED
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +263,7 @@ class AppController:
         if self._logged_on():
             self._start_join(self.saved.lobby_id, self.saved.access_code, "rejoin")
         else:
-            self._lose_connection(logged_on=False)
+            self._lose_connection(logged_on=False, reason="not logged on to Steam")
 
     # What the UI shows
 
@@ -558,7 +565,7 @@ class AppController:
                 self._farewell()
             return
         if self.saved is not None and (self.network is not None or self.link is not None):
-            self._watch_connection()
+            self._watch_connection(callbacks)
 
         network = self.network
         if network is not None:
@@ -580,21 +587,53 @@ class AppController:
             return False
 
     def _in_lobby(self, lobby_id: int) -> bool:
-        """Whether Steam still has this PC in the lobby."""
+        """Whether Steam still has this PC in the lobby, after a loss.
+
+        Only lobby members can read its owner, and every lobby has one.
+        """
         try:
-            return self.steam_id in self.steam.lobby_members(lobby_id) and bool(
-                self.steam.lobby_owner(lobby_id)
-            )
+            return bool(self.steam.lobby_owner(lobby_id))
         except SteamError:
             return False
 
-    def _watch_connection(self) -> None:
-        logged_on = self._logged_on()
+    def _local_loss(self, callbacks, lobby_id: int) -> str:
+        """Why this PC itself lost its connection, going only by what its own
+        Steam client says; "" if it didn't."""
+        if not self._logged_on():
+            return "not logged on to Steam"
+        removed = (
+            ChatMemberStateChange.LEFT
+            | ChatMemberStateChange.DISCONNECTED
+            | ChatMemberStateChange.KICKED
+            | ChatMemberStateChange.BANNED
+        )
+        for callback in callbacks:
+            if callback.callback_id == STEAM_SERVERS_DISCONNECTED and not callback.api_call:
+                # Even if it is already back: a short drop can still have
+                # cost this PC its place in the lobby.
+                return "Steam lost its servers"
+            try:
+                event = decode_lobby_event(callback)
+            except SteamError:
+                continue
+            if (
+                isinstance(event, LobbyMemberUpdate)
+                and event.lobby_id == lobby_id
+                and event.user_id == self.steam_id
+                and event.state & removed
+            ):
+                return "Steam took this PC out of the lobby"
+        return ""
+
+    def _watch_connection(self, callbacks) -> None:
         if self.link is None:
             network = self.network
-            if network is not None and not (logged_on and self._in_lobby(network.lobby_id)):
-                self._lose_connection(logged_on)
+            if network is not None:
+                reason = self._local_loss(callbacks, network.lobby_id)
+                if reason:
+                    self._lose_connection(self._logged_on(), reason)
             return
+        logged_on = self._logged_on()
         if not logged_on:
             if self.link is Link.RESTORING_NETWORK:
                 log.info("Lost the connection to Steam again")
@@ -621,12 +660,12 @@ class AppController:
             self._next_attempt = now + delay
             self._start_join(self.saved.lobby_id, self.saved.access_code, "restore")
 
-    def _lose_connection(self, logged_on: bool) -> None:
+    def _lose_connection(self, logged_on: bool, reason: str = "") -> None:
         """The connection was lost by accident: keep everything, and recover."""
         network = self.network
         if self.link is None:
+            log.info("Local Steam connection lost (%s); the network is on hold", reason)
             if network is not None:
-                log.info("Lost the connection to the network")
                 members = network.members()
             else:
                 members = self._offline_members(status="\u2014")
@@ -794,7 +833,7 @@ class AppController:
             self.error = f"Could not go online: {message}"
         elif pending.kind == "rejoin":
             # Probably the connection; keep trying.
-            self._lose_connection(self._logged_on())
+            self._lose_connection(self._logged_on(), "could not get back into the lobby")
         else:
             self.error = message
 

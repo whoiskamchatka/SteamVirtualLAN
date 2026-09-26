@@ -56,6 +56,8 @@ class LobbySession:
         # While paused (this PC lost its connection to Steam), no connections
         # are started; existing ones are left to Steam.
         self.paused = False
+        # Set when Steam's member list couldn't be read; read again next time.
+        self._members_unsettled = False
         # Messages read from connections just before they were closed.
         self._drained: list[tuple[int, bytes]] = []
         self.update_members()
@@ -64,8 +66,22 @@ class LobbySession:
         return [peer.steam_id for peer in self.peers.values() if peer.connected]
 
     def update_members(self) -> None:
-        """Make the peers match Steam's current lobby member list."""
-        members = set(self.steam.lobby_members(self.lobby_id)) - {self.local_id}
+        """Make the peers match Steam's current lobby member list.
+
+        Right after someone joins or leaves, Steam's local copy of the lobby
+        can be mid-update: the list can't be read, or doesn't even have this
+        PC in it. Such a list says nothing about who is in the lobby, so the
+        peers stay as they are and it is read again on the next process().
+        """
+        try:
+            members = set(self.steam.lobby_members(self.lobby_id))
+        except SteamError:
+            members = set()
+        if self.local_id not in members:
+            self._members_unsettled = True
+            return
+        self._members_unsettled = False
+        members.discard(self.local_id)
         for steam_id in sorted(members - self.peers.keys()):
             self.peers[steam_id] = Peer(steam_id, initiates(self.local_id, steam_id))
             self.log(f"Peer joined: {steam_id}")
@@ -88,6 +104,8 @@ class LobbySession:
             event = decode_networking_event(callback)
             if isinstance(event, ConnectionStatusChange):
                 self._connection_changed(event)
+        if self._members_unsettled:
+            self.update_members()
 
         self._connect()
         drained, self._drained = self._drained, []

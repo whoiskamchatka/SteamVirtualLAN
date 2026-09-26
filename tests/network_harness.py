@@ -40,7 +40,7 @@ class Net:
 
     def start(self, steam_id, logged_on=True) -> AppController:
         """Start SteamVirtualLAN on steam_id's PC (again)."""
-        steam = self.world.client(steam_id, NAMES[steam_id])
+        steam = self.world.client(steam_id, NAMES.get(steam_id, ""))
         steam.logged_on = logged_on
         send = steam.send_message
 

@@ -191,7 +191,6 @@ class NetworkSession:
         and start no connections until resume()."""
         if self.suspended:
             return
-        log.info("Connection to Steam lost; the network is on hold")
         self.suspended = True
         self.lobby.pause()
         self.latency.clear()
@@ -199,7 +198,6 @@ class NetworkSession:
     def resume(self) -> None:
         """Back in the lobby after suspend(): follow it as it is now and
         reconnect to every member whose connection dropped meanwhile."""
-        log.info("Connection to Steam restored")
         self.suspended = False
         self.lost.clear()
         self.lobby.resume()
@@ -398,7 +396,8 @@ class NetworkSession:
         try:
             owner = self.steam.lobby_owner(self.lobby_id)
         except SteamError:
-            owner = 0
+            # Steam's copy of the lobby is mid-update; nothing changed yet.
+            return
         previous = self.coordinator_id
         if owner != previous:
             self.coordinator_id = owner
@@ -538,10 +537,16 @@ class NetworkSession:
             event = decode_lobby_event(callback)
             if not isinstance(event, LobbyMemberUpdate) or event.lobby_id != self.lobby_id:
                 continue
+            if event.user_id == self.local_id:
+                continue
             if event.state & ChatMemberStateChange.DISCONNECTED:
                 self.lost.add(event.user_id)
+                if event.user_id in self.roster:
+                    log.info("Peer lost its connection to Steam: %s", event.user_id)
             else:
                 self.lost.discard(event.user_id)
+                if event.state & ChatMemberStateChange.LEFT and event.user_id in self.roster:
+                    log.info("Peer went offline: %s", event.user_id)
 
     def _ping(self) -> None:
         """Measure the round trip to every connected member (latency.py)."""

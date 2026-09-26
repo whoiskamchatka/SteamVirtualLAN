@@ -40,6 +40,11 @@ class SteamAPICallCompleted(ctypes.Structure):
 
 STEAM_API_CALL_COMPLETED = 703  # SteamAPICallCompleted_t::k_iCallback
 
+# SteamServersConnected_t and SteamServersDisconnected_t: this PC's Steam
+# client got or lost its connection to the Steam servers.
+STEAM_SERVERS_CONNECTED = 101
+STEAM_SERVERS_DISCONNECTED = 103
+
 # SteamAPICall_t returned when a call could not be started.
 API_CALL_INVALID = 0
 
