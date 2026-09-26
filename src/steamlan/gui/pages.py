@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from steamlan.app.controller import View
+from steamlan.app.controller import Presence, View
 from steamlan.gui.widgets import (
     CopyField,
     MemberRow,
@@ -46,19 +46,25 @@ class HomePage(QWidget):
         layout.addWidget(steam_card)
 
         layout.addSpacing(10)
-        self.create_button = button("Create Lobby", "primary")
+        self.create_button = button("Create Network", "primary")
         self.create_button.clicked.connect(self.create)
         layout.addWidget(self.create_button)
-        layout.addWidget(label("Host a network and invite Steam friends.", "muted"))
+        layout.addWidget(label("Start a network and invite Steam friends.", "muted"))
         layout.addSpacing(6)
-        self.join_button = button("Join Lobby")
+        self.join_button = button("Join Network")
         self.join_button.clicked.connect(self.join)
         layout.addWidget(self.join_button)
         layout.addWidget(label("Join with a Lobby ID and access code.", "muted"))
         self.message = label(wrap=True)
         layout.addWidget(self.message)
         layout.addStretch(1)
-        layout.addWidget(label("Keep SteamVirtualLAN open while you are connected.", "caption"))
+        layout.addWidget(
+            label(
+                "Closing the window keeps SteamVirtualLAN running in the notification area.",
+                "caption",
+                True,
+            )
+        )
 
     def render(self, view: View) -> None:
         self.steam_status.set(view.steam_status, view.steam_tone)
@@ -85,7 +91,9 @@ class JoinPage(QWidget):
         layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addSpacing(6)
         layout.addWidget(label("Join a network", "heading"))
-        layout.addWidget(label("Enter the Lobby ID and access code from the host.", "muted", True))
+        layout.addWidget(
+            label("Enter the Lobby ID and access code from a member of the network.", "muted", True)
+        )
         layout.addSpacing(14)
 
         layout.addWidget(label("LOBBY ID", "caption"))
@@ -129,8 +137,9 @@ class JoinPage(QWidget):
             self.submit.emit(self.lobby_id.text(), self.access_code.text())
 
 
-class LobbyPage(QWidget):
+class NetworkPage(QWidget):
     invite = Signal()
+    toggle_online = Signal()
     leave = Signal()
 
     def __init__(self):
@@ -143,8 +152,6 @@ class LobbyPage(QWidget):
         self.status = StatusLine("heading")
         self.status.dot.set_tone("pending")
         header.addWidget(self.status, 1)
-        self.role = label(name="badge")
-        header.addWidget(self.role, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
         details, details_layout = card()
@@ -183,20 +190,23 @@ class LobbyPage(QWidget):
         layout.addWidget(scroll, 1)
         self._rows: dict[int, MemberRow] = {}
 
-        self.notice = label(name="notice")
+        self._error_shown = False
+        self.notice = label(name="notice", wrap=True)
         layout.addWidget(self.notice)
         buttons = QHBoxLayout()
         self.invite_button = button("Invite Steam Friend")
         self.invite_button.clicked.connect(self.invite)
-        leave = button("Leave Lobby", "danger")
-        leave.clicked.connect(self.leave)
+        self.online_button = button("Go Offline")
+        self.online_button.clicked.connect(self.toggle_online)
+        self.leave_button = button("Leave Network", "danger")
+        self.leave_button.clicked.connect(self.leave)
         buttons.addWidget(self.invite_button, 1)
-        buttons.addWidget(leave)
+        buttons.addWidget(self.online_button, 1)
+        buttons.addWidget(self.leave_button)
         layout.addLayout(buttons)
 
     def render(self, view: View) -> None:
         self.status.set(view.network_status, view.network_tone)
-        self.role.setText("Host" if view.is_host else "Member")
         self.lobby_id.set_value(str(view.lobby_id))
         self.access_code.set_value(view.access_code)
         self.access_code.setVisible(bool(view.access_code))
@@ -204,8 +214,17 @@ class LobbyPage(QWidget):
         self.adapter_status.set(view.adapter_status, view.adapter_tone)
         for widget in (self.adapter_divider, self.adapter_caption, self.adapter_status):
             widget.setVisible(bool(view.adapter_status))
-        self.invite_button.setVisible(view.is_host)
-        self.member_count.setText(str(len(view.members)))
+        self.invite_button.setVisible(view.can_invite)
+        offline = view.presence is Presence.OFFLINE
+        self.online_button.setText("Go Online" if offline else "Go Offline")
+        set_style_name(self.online_button, "primary" if offline else "")
+        self.online_button.setEnabled(view.steam_ready)
+        self.member_count.setText(view.online_summary)
+        if view.error:
+            self.show_notice(view.error, error=True)
+            self._error_shown = True
+        elif self._error_shown:
+            self.show_notice("")
 
         present = {member.steam_id for member in view.members}
         for steam_id in list(self._rows):
@@ -219,5 +238,6 @@ class LobbyPage(QWidget):
             row.show_member(member)
 
     def show_notice(self, text: str, error: bool = False) -> None:
+        self._error_shown = False
         set_style_name(self.notice, "error" if error else "notice")
         self.notice.setText(text)

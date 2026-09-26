@@ -56,26 +56,30 @@ def test_invalid_lobby_id(text):
 
 
 def test_messages_round_trip():
+    address = IPv4Address("10.77.0.7")
     assert access.parse_message(access.auth_message("7K2QDM9XTE")) == access.Message(
         "auth", code="7K2QDM9XTE"
     )
-    assert access.parse_message(access.auth_message("")) == access.Message("auth", code="")
-    assert access.parse_message(access.ACCEPTED) == access.Message("accepted")
-    assert access.parse_message(access.DENIED) == access.Message("denied")
-    addresses = {USER + 1: IPv4Address("10.77.0.2"), USER: IPv4Address("10.77.0.1")}
-    members = access.parse_message(access.members_message(addresses))
-    assert members == access.Message(
-        "members",
-        addresses=((USER, IPv4Address("10.77.0.1")), (USER + 1, IPv4Address("10.77.0.2"))),
+    assert access.parse_message(access.auth_message("7K2QDM9XTE", address)) == access.Message(
+        "auth", code="7K2QDM9XTE", address=address
     )
-    assert members.members == (USER, USER + 1)
-    assert access.parse_message(access.members_message({})) == access.Message("members")
+    assert access.parse_message(access.auth_message("")) == access.Message("auth", code="")
+    assert access.parse_message(access.auth_message("", address)) == access.Message(
+        "auth", address=address
+    )
+    assert access.parse_message(access.accepted_message("7K2QDM9XTE")) == access.Message(
+        "accepted", code="7K2QDM9XTE"
+    )
+    assert access.parse_message(access.DENIED) == access.Message("denied")
+    assert access.parse_message(access.LEAVE) == access.Message("leave")
 
 
-def test_members_message_format():
-    message = access.members_message({USER: IPv4Address("10.77.0.1")})
-
-    assert message == f"SVL1 MEMBERS {USER}=10.77.0.1".encode()
+def test_message_format():
+    assert access.auth_message("7K2QDM9XTE", IPv4Address("10.77.0.7")) == (
+        b"SVL2 AUTH 7K2QDM9XTE 10.77.0.7"
+    )
+    assert access.accepted_message("7K2QDM9XTE") == b"SVL2 OK 7K2QDM9XTE"
+    assert access.LEAVE == b"SVL2 LEAVE"
 
 
 @pytest.mark.parametrize(
@@ -83,24 +87,35 @@ def test_members_message_format():
     [
         b"",
         b"hello",
-        b"SVL1 AUTH " + b"A" * 11,
-        b"SVL1 AUTH \xff\xfe",
-        b"SVL1 MEMBERS 1,x",
-        b"SVL1 MEMBERS -5",
-        b"SVL1 MEMBERS " + str(2**64).encode(),
-        b"SVL1 MEMBERS 5",
-        b"SVL1 MEMBERS 5=10.77.0.x",
-        b"SVL1 MEMBERS 5=192.168.1.2",
-        b"SVL1 MEMBERS 5=10.77.0.0",
-        b"SVL1 MEMBERS 5=10.77.0.255",
-        b"SVL1 MEMBERS 0=10.77.0.2",
-        b"SVL1 MEMBERS 5=10.77.0.2,5=10.77.0.3",
-        b"SVL1 MEMBERS 5=10.77.0.2,6=10.77.0.2",
+        b"SVL1 OK",
+        b"SVL1 AUTH 7K2QDM9XTE",
+        b"SVL1 DENIED",
+        b"SVL2 AUTH " + b"A" * 11,
+        b"SVL2 AUTH \xff\xfe",
+        b"SVL2 AUTH 7K2QDM9XTE 10.77.0.x",
+        b"SVL2 AUTH 7K2QDM9XTE 192.168.1.2",
+        b"SVL2 AUTH 7K2QDM9XTE 10.77.0.255",
+        b"SVL2 AUTH 7K2QDM9XTE 10.77.0.2 more",
         b"SVL2 OK",
+        b"SVL2 OK ",
+        b"SVL2 OK 7K2QD",
+        b"SVL2 OK 7K2QDM9XTU",
+        b"SVL2 LEAVE now",
+        b"SVL2 MEMBERS 5=10.77.0.2",
     ],
 )
 def test_malformed_messages_are_ignored(data):
     assert access.parse_message(data) is None
+
+
+def test_network_ids():
+    ids = {access.generate_network_id() for _ in range(100)}
+
+    assert len(ids) == 100
+    assert all(access.is_network_id(network_id) for network_id in ids)
+    assert not access.is_network_id("")
+    assert not access.is_network_id("0123456789ABCDEF")
+    assert not access.is_network_id("0123456789abcde")
 
 
 def test_invite_connect_string_round_trip():

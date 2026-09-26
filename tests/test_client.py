@@ -1067,3 +1067,27 @@ def test_join_lobby_timeout(steam, lib, clock, join_call):
 
     assert 3 <= clock.slept < 3.1
     assert steam.run_callbacks() == [SteamCallback(LOBBY_ENTER, lobby_entered())]
+
+
+def test_set_lobby_owner(steam, lib):
+    lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.return_value = True
+
+    steam.set_lobby_owner(LOBBY_ID, OTHER_STEAM_ID)
+
+    lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.assert_called_once_with(
+        MATCHMAKING, LOBBY_ID, OTHER_STEAM_ID
+    )
+
+
+def test_set_lobby_owner_when_not_the_owner(steam, lib):
+    lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.return_value = False
+
+    with pytest.raises(SteamError, match="SetLobbyOwner failed"):
+        steam.set_lobby_owner(LOBBY_ID, OTHER_STEAM_ID)
+
+
+def test_set_lobby_owner_invalid_id(steam, lib):
+    with pytest.raises(ValueError, match="new owner SteamID"):
+        steam.set_lobby_owner(LOBBY_ID, 0)
+
+    lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.assert_not_called()

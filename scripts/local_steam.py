@@ -1,14 +1,13 @@
 """Setup shared by the developer scripts in this directory.
 
-The scripts use steamworks/steam_api64.dll from the repository root. The app ID
+The scripts use steam_api64.dll from the repository root, like the app. The app ID
 is handled like in the app: steam_appid.txt in the repository root, written when
 needed.
 """
 
 import os
-from pathlib import Path
 
-from steamlan.app.steamworks import prepare_app_id
+from steamlan.app.steamworks import prepare_app_id, steam_api_dir
 from steamlan.steam import (
     STEAM_API_DLL,
     ConnectionStatusChange,
@@ -19,14 +18,13 @@ from steamlan.steam import (
     decode_networking_event,
 )
 
-STEAMWORKS_DIR = Path(__file__).resolve().parent.parent / "steamworks"
 STEAM_ERRORS = (SteamAPILoadError, SteamInitError, SteamError)
 POLL_INTERVAL = 0.05
 
 
 def local_client(dll_path: str | os.PathLike[str] | None = None) -> SteamClient:
     prepare_app_id()
-    return SteamClient(dll_path or STEAMWORKS_DIR / STEAM_API_DLL)
+    return SteamClient(dll_path or steam_api_dir() / STEAM_API_DLL)
 
 
 def parse_steam_id(text: str) -> int:

@@ -32,18 +32,18 @@ QLabel#error {{ color: {ERROR}; }}
 QLabel#notice {{ color: {OK}; }}
 QLabel#value {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }}
 QLabel#memberName {{ font-weight: 600; }}
+QLabel#memberNameOffline {{ font-weight: 600; color: {MUTED}; }}
 QLabel#memberStatus {{ color: {MUTED}; font-size: 12px; }}
 QLabel#address {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }}
+QLabel#addressOffline {{
+    font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; color: {MUTED};
+}}
 QLabel#avatar {{
     background: {RAISED}; color: {MUTED}; border-radius: 16px;
     font-weight: 600; qproperty-alignment: AlignCenter;
 }}
 QLabel#badge {{
     background: {RAISED}; color: {MUTED}; border-radius: 5px;
-    padding: 1px 6px; font-size: 11px; font-weight: 600;
-}}
-QLabel#badgeAccent {{
-    background: {ACCENT_SOFT}; color: #8fb1ff; border-radius: 5px;
     padding: 1px 6px; font-size: 11px; font-weight: 600;
 }}
 

@@ -10,3 +10,9 @@ def no_real_network_helper(monkeypatch):
 
     monkeypatch.setattr("steamlan.app.controller.AdapterHelper", refuse)
     monkeypatch.setattr("steamlan.adapter.launcher.start_process", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_saved_state(tmp_path_factory, monkeypatch):
+    """Tests must never read or write the user's real saved network."""
+    monkeypatch.setenv("STEAMLAN_STATE_DIR", str(tmp_path_factory.mktemp("state")))

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 PROTOCOLS = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP"}
 
-# Every SteamVirtualLAN network uses this subnet. The host is always .1.
+# Every SteamVirtualLAN network uses this subnet. The member that creates a
+# network gets the first address, .1; see app/roster.py.
 VIRTUAL_NETWORK = ipaddress.IPv4Network("10.77.0.0/24")
-HOST_ADDRESS = VIRTUAL_NETWORK[1]
 
 
 def is_member_address(address: ipaddress.IPv4Address) -> bool:

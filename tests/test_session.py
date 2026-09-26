@@ -14,6 +14,7 @@ from steamlan.steam.native import (
     LobbyChatUpdate,
     SteamNetConnectionStatusChangedCallback,
 )
+from steamlan.steam.session import RECONNECT_DELAY
 
 LOBBY_ID = 109775240917097000
 OTHER_LOBBY_ID = 109775240917097999
@@ -88,8 +89,18 @@ class FakeSteam:
         return self.inbox.pop(connection, [])
 
 
-def session(steam, log=None):
-    return LobbySession(steam, LOBBY_ID, LISTEN_SOCKET, log=log or (lambda message: None))
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def session(steam, log=None, clock=None):
+    return LobbySession(
+        steam, LOBBY_ID, LISTEN_SOCKET, log=log or (lambda message: None), clock=clock or Clock()
+    )
 
 
 def test_lower_steam_id_initiates():
@@ -290,10 +301,11 @@ def test_connection_with_wrong_identity_is_closed():
 @pytest.mark.parametrize(
     "state", [ConnectionState.CLOSED_BY_PEER, ConnectionState.PROBLEM_DETECTED_LOCALLY]
 )
-def test_ended_connection_is_cleared_and_not_retried(state):
+def test_ended_connection_is_cleared_and_retried_later(state):
     log = []
+    clock = Clock()
     steam = FakeSteam(members=[ME, HIGH])
-    s = session(steam, log=log.append)
+    s = session(steam, log=log.append, clock=clock)
     s.poll()
     steam.frames = [
         [status(101, ConnectionState.CONNECTED, HIGH)],
@@ -313,6 +325,77 @@ def test_ended_connection_is_cleared_and_not_retried(state):
     with pytest.raises(SteamError, match="not connected"):
         s.send(HIGH, b"x")
     assert any("timed out" in line for line in log)
+
+    # The member is still in the lobby, so this side connects again, later.
+    clock.now = RECONNECT_DELAY - 0.1
+    s.poll()
+    assert steam.connects == [(HIGH, 101)]
+    clock.now = RECONNECT_DELAY + 0.1
+    s.poll()
+    assert steam.connects == [(HIGH, 101), (HIGH, 102)]
+    assert (s.peers[HIGH].connection, s.peers[HIGH].ended) == (102, "")
+
+
+def test_accepting_side_takes_a_new_connection_after_a_drop():
+    steam = FakeSteam(members=[LOW, ME])
+    s = session(steam)
+    steam.frames = [
+        [incoming(7, LOW)],
+        [status(7, ConnectionState.CONNECTED, LOW, LISTEN_SOCKET)],
+        [status(7, ConnectionState.PROBLEM_DETECTED_LOCALLY, LOW, LISTEN_SOCKET)],
+        [incoming(8, LOW)],
+    ]
+
+    for _ in range(4):
+        s.poll()
+
+    assert steam.accepted == [7, 8]
+    assert s.peers[LOW].connection == 8
+    assert steam.connects == []
+
+
+def test_denied_peer_is_never_retried():
+    clock = Clock()
+    steam = FakeSteam(members=[ME, HIGH])
+    s = session(steam, clock=clock)
+    s.poll()
+    steam.frames = [[status(101, ConnectionState.CONNECTED, HIGH)]]
+    s.poll()
+
+    s.disconnect(HIGH, "access denied", linger=True)
+    clock.now = 1000
+    s.poll()
+
+    assert steam.connects == [(HIGH, 101)]
+
+
+def test_messages_that_arrived_before_the_peer_closed_are_still_received():
+    steam = FakeSteam(members=[ME, HIGH])
+    s = session(steam)
+    s.poll()
+    steam.frames = [
+        [status(101, ConnectionState.CONNECTED, HIGH)],
+        [status(101, ConnectionState.CLOSED_BY_PEER, HIGH)],
+    ]
+    s.poll()
+    steam.inbox[101] = [b"last words"]
+
+    assert s.poll() == [(HIGH, b"last words")]
+    assert steam.closed == [101]
+
+
+def test_messages_from_a_member_that_left_are_still_received():
+    steam = FakeSteam(members=[ME, HIGH])
+    s = session(steam)
+    s.poll()
+    steam.frames = [[status(101, ConnectionState.CONNECTED, HIGH)]]
+    s.poll()
+    steam.inbox[101] = [b"bye"]
+    steam.members.remove(HIGH)
+    steam.frames = [[member_update(HIGH, ChatMemberStateChange.LEFT)]]
+
+    assert s.poll() == [(HIGH, b"bye")]
+    assert s.peers == {}
 
 
 def test_leaving_member_closes_its_connection():

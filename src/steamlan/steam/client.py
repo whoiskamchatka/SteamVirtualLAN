@@ -283,8 +283,22 @@ class SteamClient:
             raise SteamError("Steam returned no lobby owner")
         return owner
 
+    def set_lobby_owner(self, lobby_id: int, new_owner: int) -> None:
+        """Hand lobby ownership to another member. Only the owner can do this.
+
+        Steam also moves ownership by itself when the owner leaves the lobby
+        or loses its connection to Steam; see GetLobbyOwner.
+        """
+        lib = self._running_lib()
+        _check_steam_id(new_owner, "new owner SteamID")
+        if not lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner(
+            self._matchmaking(lib), lobby_id, new_owner
+        ):
+            raise SteamError("SetLobbyOwner failed; only the owner can, and only to a lobby member")
+
     def set_lobby_data(self, lobby_id: int, key: str, value: str) -> None:
-        """Set lobby metadata. Anyone who knows the lobby ID can read it."""
+        """Set lobby metadata. Only the lobby owner can; anyone who knows the
+        lobby ID can read it."""
         lib = self._running_lib()
         if not lib.SteamAPI_ISteamMatchmaking_SetLobbyData(
             self._matchmaking(lib), lobby_id, key.encode(), value.encode()

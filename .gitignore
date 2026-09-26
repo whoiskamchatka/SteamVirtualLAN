@@ -18,7 +18,11 @@ env/
 htmlcov/
 
 # Valve's Steamworks SDK and redistributables stay local; never commit them.
+# During development steam_api64.dll lives in the repository root, where a
+# packaged SteamVirtualLAN.exe finds it too: next to the executable.
 # steam_appid.txt is ours (written by SteamVirtualLAN) and is not ignored.
+/steam_api64.dll
+# Where older checkouts kept the DLL.
 /steamworks/
 sdk/
 steamworks_sdk*/

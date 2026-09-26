@@ -365,6 +365,13 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.restype = ctypes.c_uint64
 
+        lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.restype = ctypes.c_bool
+
         lib.SteamAPI_ISteamFriends_GetFriendPersonaName.argtypes = [
             ctypes.c_void_p,
             ctypes.c_uint64,

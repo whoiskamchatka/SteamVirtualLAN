@@ -77,3 +77,48 @@ def test_prepare_app_id_uses_working_directory(project, monkeypatch):
     steamworks.prepare_app_id()
 
     assert (project / "steam_appid.txt").is_file()
+
+
+def test_steam_api_dir_is_the_repository_root(monkeypatch):
+    monkeypatch.delenv("STEAMLAN_STEAM_API_DIR", raising=False)
+    monkeypatch.delattr("sys.frozen", raising=False)
+    root = steamworks.steam_api_dir()
+
+    assert steamworks.is_project_root(root)
+    assert (root / "src" / "steamlan" / "app" / "steamworks.py").is_file()
+
+
+def test_steam_api_dir_is_next_to_the_packaged_exe(tmp_path, monkeypatch):
+    monkeypatch.delenv("STEAMLAN_STEAM_API_DIR", raising=False)
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("sys.executable", str(tmp_path / "SteamVirtualLAN.exe"))
+
+    assert steamworks.steam_api_dir() == tmp_path.resolve()
+
+
+def test_steam_api_dir_outside_a_checkout_is_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.delenv("STEAMLAN_STEAM_API_DIR", raising=False)
+    monkeypatch.setattr(steamworks, "_SOURCE_ROOT", tmp_path / "site-packages")
+    monkeypatch.chdir(tmp_path)
+
+    assert steamworks.steam_api_dir() == tmp_path.resolve()
+
+
+def test_steam_api_dir_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("STEAMLAN_STEAM_API_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+
+    assert steamworks.steam_api_dir() == tmp_path.resolve()
+
+
+def test_open_steam_loads_the_dll_from_the_repository_root(monkeypatch):
+    monkeypatch.delenv("STEAMLAN_STEAM_API_DIR", raising=False)
+    monkeypatch.setattr(steamworks, "prepare_app_id", lambda: None)
+    started = []
+    monkeypatch.setattr(steamworks.SteamClient, "start", lambda self: started.append(self))
+
+    steam = steamworks.open_steam()
+
+    assert started == [steam]
+    assert steam.dll_path == steamworks.steam_api_dir() / "steam_api64.dll"
+    assert steam.dll_path.parent.name != "steamworks"

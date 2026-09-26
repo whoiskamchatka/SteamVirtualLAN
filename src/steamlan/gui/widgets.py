@@ -112,7 +112,8 @@ class CopyField(QWidget):
 
 
 class MemberRow(QFrame):
-    """One lobby member, with its virtual IP address on the right."""
+    """One network member: name, Online or Offline, and its virtual IP address
+    on the right. All members are equal; only "You" is marked."""
 
     def __init__(self):
         super().__init__()
@@ -130,10 +131,8 @@ class MemberRow(QFrame):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.name = label(name="memberName")
-        self.host_badge = label("Host", "badgeAccent")
         self.you_badge = label("You", "badge")
         top.addWidget(self.name)
-        top.addWidget(self.host_badge)
         top.addWidget(self.you_badge)
         top.addStretch(1)
         column.addLayout(top)
@@ -148,8 +147,9 @@ class MemberRow(QFrame):
     def show_member(self, member: MemberView) -> None:
         self.name.setText(member.name)
         self.avatar.setText(member.name[:1].upper() or "?")
-        self.host_badge.setVisible(member.is_host)
         self.you_badge.setVisible(member.is_you)
         self.status.set(member.status, member.tone)
         self.address.setText(member.address)
+        set_style_name(self.name, "memberName" if member.online else "memberNameOffline")
+        set_style_name(self.address, "address" if member.online else "addressOffline")
         self.setToolTip(f"SteamID {member.steam_id}")

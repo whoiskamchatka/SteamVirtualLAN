@@ -2,10 +2,13 @@
 
 Steam lobbies have no passwords, and lobby metadata can be read by anyone who
 knows the lobby ID (ISteamMatchmaking::RequestLobbyData), so a password or its
-hash must never be stored there. Instead the host generates a random access
-code that only exists in its memory. A member who joins by lobby ID sends the
-code to the host over their SteamNetworkingSockets connection, which Steam
-encrypts and authenticates, and the host checks it.
+hash must never be stored there. Instead whoever creates a network generates a
+random access code. It only exists in the apps of the network's members, in
+their saved network state and in the invites they send. A new member sends the
+code to the member currently coordinating the network (see network.py) over
+their SteamNetworkingSockets connection, which Steam encrypts and
+authenticates; that member checks it and, on success, hands the new member the
+code too, so that every member can invite others and take over coordinating.
 """
 
 import hmac
@@ -23,9 +26,22 @@ CODE_LENGTH = 10  # 50 bits
 _CHAT_ACCOUNT_TYPE = 8
 
 # Non-secret lobby metadata that marks our lobbies among other apps using the
-# same AppID.
+# same AppID. The value is the protocol version; apps that speak another one
+# treat the lobby as foreign.
 LOBBY_MARKER_KEY = "steamvirtuallan"
-LOBBY_MARKER_VALUE = "1"
+LOBBY_MARKER_VALUE = "2"
+# Random and non-secret: tells a saved network apart from any other lobby that
+# might one day have the same ID.
+NETWORK_ID_KEY = "svl_network"
+NETWORK_ID_LENGTH = 16
+
+
+def generate_network_id() -> str:
+    return secrets.token_hex(NETWORK_ID_LENGTH // 2)
+
+
+def is_network_id(text: str) -> bool:
+    return len(text) == NETWORK_ID_LENGTH and all(char in "0123456789abcdef" for char in text)
 
 
 def generate_access_code() -> str:
@@ -87,68 +103,63 @@ def parse_invite_connect_string(text: str) -> tuple[int, str]:
 
 # Every control message starts with PREFIX. Control messages are only ever
 # parsed here; IP packets travel in their own kind of message (tunnel.py).
-PREFIX = b"SVL1 "
-ACCEPTED = PREFIX + b"OK"
+PREFIX = b"SVL2 "
 DENIED = PREFIX + b"DENIED"
+LEAVE = PREFIX + b"LEAVE"
 
 
 @dataclass(frozen=True)
 class Message:
-    kind: str  # "auth", "accepted", "denied" or "members"
+    # "auth": a member asks the coordinator to admit it, with the access code
+    #   it has and, when it had one before, the address it would like back.
+    # "accepted": the coordinator admitted the member; carries the access code.
+    # "denied": the coordinator refused the member.
+    # "leave": the sender leaves the network for good (Leave Network).
+    kind: str
     code: str = ""
-    # "members": the host and the members it admitted, each with the virtual
-    # IP address the host gave it, as (steam_id, address) sorted by SteamID.
-    addresses: tuple[tuple[int, IPv4Address], ...] = ()
-
-    @property
-    def members(self) -> tuple[int, ...]:
-        return tuple(steam_id for steam_id, _ in self.addresses)
+    address: IPv4Address | None = None
 
 
-def auth_message(code: str) -> bytes:
-    return PREFIX + b"AUTH " + code.encode()
+def auth_message(code: str, preferred: IPv4Address | None = None) -> bytes:
+    message = PREFIX + b"AUTH " + code.encode()
+    if preferred is not None:
+        message += b" " + str(preferred).encode()
+    return message
 
 
-def members_message(addresses: dict[int, IPv4Address]) -> bytes:
-    entries = ",".join(f"{steam_id}={address}" for steam_id, address in sorted(addresses.items()))
-    return PREFIX + b"MEMBERS " + entries.encode()
+def accepted_message(code: str) -> bytes:
+    return PREFIX + b"OK " + code.encode()
 
 
-def _parse_addresses(text: str) -> tuple[tuple[int, IPv4Address], ...] | None:
-    addresses = []
-    for part in text.split(","):
-        if not part:
-            continue
-        steam_text, separator, address_text = part.partition("=")
-        try:
-            steam_id = _parse_id(steam_text)
-            address = IPv4Address(address_text)
-        except ValueError:
-            return None
-        if not separator or not is_member_address(address):
-            return None
-        addresses.append((steam_id, address))
-    steam_ids = [steam_id for steam_id, _ in addresses]
-    unique_addresses = {address for _, address in addresses}
-    if len(set(steam_ids)) != len(addresses) or len(unique_addresses) != len(addresses):
-        return None
-    return tuple(sorted(addresses))
+def _parse_code(data: bytes) -> str | None:
+    if len(data) <= CODE_LENGTH and data.isascii() and b" " not in data:
+        return data.decode()
+    return None
 
 
 def parse_message(data: bytes) -> Message | None:
     """Decode one of our messages; None for anything else or anything malformed."""
-    if data == ACCEPTED:
-        return Message("accepted")
     if data == DENIED:
         return Message("denied")
-    if data.startswith(PREFIX + b"AUTH "):
-        code = data[len(PREFIX) + 5 :]
-        if len(code) <= CODE_LENGTH and code.isascii():
-            return Message("auth", code=code.decode())
+    if data == LEAVE:
+        return Message("leave")
+    if data.startswith(PREFIX + b"OK "):
+        code = _parse_code(data[len(PREFIX) + 3 :])
+        if code is not None and len(code) == CODE_LENGTH and set(code) <= set(ALPHABET):
+            return Message("accepted", code=code)
         return None
-    if data.startswith(PREFIX + b"MEMBERS "):
-        text = data[len(PREFIX) + 8 :].decode("ascii", errors="replace")
-        addresses = _parse_addresses(text)
-        if addresses is not None:
-            return Message("members", addresses=addresses)
+    if data.startswith(PREFIX + b"AUTH "):
+        code_part, _, address_part = data[len(PREFIX) + 5 :].partition(b" ")
+        code = _parse_code(code_part)
+        if code is None:
+            return None
+        address = None
+        if address_part:
+            try:
+                address = IPv4Address(address_part.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                return None
+            if not is_member_address(address):
+                return None
+        return Message("auth", code=code, address=address)
     return None

@@ -1,5 +1,6 @@
 """Keep one SteamNetworkingSockets connection to every other member of a lobby."""
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -7,6 +8,10 @@ from steamlan.steam.client import SteamCallback, SteamClient, SteamError
 from steamlan.steam.lobby import LobbyMemberUpdate, decode_lobby_event
 from steamlan.steam.native import ConnectionState
 from steamlan.steam.networking import ConnectionStatusChange, decode_networking_event
+
+# After a connection to a member that is still in the lobby drops, the side
+# that connects tries again this many seconds later.
+RECONNECT_DELAY = 5.0
 
 
 def initiates(local_id: int, remote_id: int) -> bool:
@@ -22,8 +27,11 @@ class Peer:
     initiator: bool
     connection: int = 0
     connected: bool = False
-    # Why the last connection ended. There is no automatic reconnect.
+    # Why the last connection ended.
     ended: str = ""
+    # When to connect again after the connection dropped; None never (the
+    # connection was closed on purpose, e.g. access was denied).
+    retry_at: float | None = None
 
 
 class LobbySession:
@@ -33,13 +41,17 @@ class LobbySession:
         lobby_id: int,
         listen_socket: int,
         log: Callable[[str], None] = lambda message: None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.steam = steam
+        self.clock = clock
         self.lobby_id = lobby_id
         self.listen_socket = listen_socket
         self.local_id = steam.steam_id
         self.log = log
         self.peers: dict[int, Peer] = {}
+        # Messages read from connections just before they were closed.
+        self._drained: list[tuple[int, bytes]] = []
         self.update_members()
 
     def connected_peers(self) -> list[int]:
@@ -72,7 +84,8 @@ class LobbySession:
                 self._connection_changed(event)
 
         self._connect()
-        return self._receive()
+        drained, self._drained = self._drained, []
+        return drained + self._receive()
 
     def send(self, steam_id: int, data: bytes, reliable: bool = True) -> None:
         peer = self.peers.get(steam_id)
@@ -86,15 +99,26 @@ class LobbySession:
         if peer is not None:
             self._close(peer, reason, linger)
 
-    def close(self) -> None:
+    def close(self, linger: bool = False) -> None:
+        """Close every connection; with linger, messages already sent are
+        still delivered."""
         for peer in self.peers.values():
-            self._close(peer, "session closed")
+            self._close(peer, "session closed", linger)
 
     def _connect(self) -> None:
+        now = self.clock()
         for peer in self.peers.values():
-            if peer.initiator and not peer.connection and not peer.ended:
+            if not peer.initiator or peer.connection:
+                continue
+            if peer.ended:
+                if peer.retry_at is None or now < peer.retry_at:
+                    continue
+                self.log(f"Reconnecting to {peer.steam_id}...")
+            else:
                 self.log(f"Connecting to {peer.steam_id}...")
-                peer.connection = self.steam.connect_p2p(peer.steam_id, 0)
+            peer.ended = ""
+            peer.retry_at = None
+            peer.connection = self.steam.connect_p2p(peer.steam_id, 0)
 
     def _connection_changed(self, event: ConnectionStatusChange) -> None:
         peer = next((p for p in self.peers.values() if p.connection == event.connection), None)
@@ -112,6 +136,9 @@ class LobbySession:
             self.log(f"Connected to {peer.steam_id}")
         elif event.ended:
             self._close(peer, f"{event.state.name}, reason {event.end_reason}: {event.end_debug}")
+            # The member is still in the lobby: this was a network problem or
+            # the other side restarting, not the member going away.
+            peer.retry_at = self.clock() + RECONNECT_DELAY
 
     def _accept(self, event: ConnectionStatusChange) -> None:
         steam_id = event.remote_steam_id
@@ -139,6 +166,7 @@ class LobbySession:
             return
         peer.connection = event.connection
         peer.ended = ""
+        peer.retry_at = None
         self.log(f"Accepted connection from {steam_id}")
 
     def _receive(self) -> list[tuple[int, bytes]]:
@@ -150,9 +178,19 @@ class LobbySession:
         return received
 
     def _close(self, peer: Peer, reason: str, linger: bool = False) -> None:
+        if peer.connected:
+            # A member often closes right after its last message (access
+            # denied, leaving the network); what already arrived is still
+            # there until the connection is closed on this side too.
+            try:
+                messages = self.steam.receive_messages(peer.connection)
+            except SteamError:
+                messages = []
+            self._drained += [(peer.steam_id, data) for data in messages]
         if peer.connection:
             self.steam.close_connection(peer.connection, reason, linger)
             self.log(f"Connection to {peer.steam_id} closed: {reason}")
         peer.connection = 0
         peer.connected = False
         peer.ended = reason
+        peer.retry_at = None

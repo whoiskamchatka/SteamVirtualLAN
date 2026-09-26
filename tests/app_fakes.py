@@ -126,6 +126,8 @@ class FakeSteam:
 
     def set_lobby_data(self, lobby_id, key, value):
         self._record("set_lobby_data", lobby_id, key, value)
+        if self.owner != self.steam_id:
+            raise SteamError(f"SetLobbyData failed for {key!r}")
         self.lobby_metadata[key] = value
 
     def lobby_data(self, lobby_id, key):
@@ -133,6 +135,10 @@ class FakeSteam:
 
     def lobby_owner(self, lobby_id):
         return self.owner
+
+    def set_lobby_owner(self, lobby_id, new_owner):
+        self._record("set_lobby_owner", lobby_id, new_owner)
+        self.owner = new_owner
 
     def lobby_members(self, lobby_id):
         return list(self.members)

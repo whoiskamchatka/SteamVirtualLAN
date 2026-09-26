@@ -1,46 +1,86 @@
-"""Virtual IP assignment and the rules for carrying packets between members."""
+"""The roster of members and addresses, and the rules for carrying packets between members."""
 
 from ipaddress import IPv4Address
 
 import pytest
 from app_fakes import ipv4_packet
 
-from steamlan.app import access, tunnel
-from steamlan.app.addresses import AddressPool
+from steamlan.app import access, roster, tunnel
 
 HOST, B, C, D = 1, 2, 3, 4
 A1, A2, A3 = (IPv4Address(f"10.77.0.{n}") for n in (1, 2, 3))
 
 
-def test_host_is_first_and_members_follow_in_order():
-    pool = AddressPool(HOST)
+def test_addresses_are_given_lowest_first_and_kept():
+    members = {}
 
-    assert pool.assigned == {HOST: A1}
-    assert pool.assign(B) == A2
-    assert pool.assign(C) == A3
-    assert pool.assign(B) == A2
-
-
-def test_released_addresses_are_reused_lowest_first():
-    pool = AddressPool(HOST)
-    pool.assign(B)
-    pool.assign(C)
-
-    pool.release(B)
-    pool.release(HOST)
-
-    assert pool.assign(D) == A2
-    assert pool.assigned[HOST] == A1
+    assert roster.assign(members, HOST) == A1
+    assert roster.assign(members, B) == A2
+    assert roster.assign(members, C) == A3
+    assert roster.assign(members, B) == A2
+    assert members == {HOST: A1, B: A2, C: A3}
 
 
-def test_pool_runs_out_after_253_members():
-    pool = AddressPool(HOST)
-    for steam_id in range(10, 10 + 253):
-        pool.assign(steam_id)
+def test_freed_addresses_are_given_out_again_lowest_first():
+    members = {HOST: A1, B: A2, C: A3}
 
-    assert pool.assigned[262] == IPv4Address("10.77.0.254")
+    del members[B]
+    del members[HOST]
+
+    assert roster.assign(members, D) == A1
+
+
+def test_preferred_address_when_free():
+    members = {HOST: A1}
+
+    assert roster.assign(members, B, IPv4Address("10.77.0.9")) == IPv4Address("10.77.0.9")
+    assert roster.assign(members, C, IPv4Address("10.77.0.9")) == A2
+    assert roster.assign(members, D, IPv4Address("10.77.0.255")) == A3
+
+
+def test_roster_runs_out_after_254_members():
+    members = {}
+    for steam_id in range(10, 10 + 254):
+        roster.assign(members, steam_id)
+
+    assert members[263] == IPv4Address("10.77.0.254")
     with pytest.raises(ValueError, match="no free address"):
-        pool.assign(999)
+        roster.assign(members, 999)
+
+
+def test_roster_round_trips_through_lobby_metadata():
+    members = {C: A3, HOST: A1}
+
+    assert roster.encode(members) == "1=10.77.0.1,3=10.77.0.3"
+    assert roster.decode(roster.encode(members)) == members
+    assert roster.decode("") == {}
+
+
+def test_roster_of_every_address_fits_lobby_metadata():
+    members = {76561197960265729 + n: IPv4Address(f"10.77.0.{n + 1}") for n in range(254)}
+
+    # Steam keeps lobby metadata values up to k_cubChatMetadataMax, 8192 bytes.
+    assert len(roster.encode(members)) < 8192
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1,x",
+        "-5=10.77.0.2",
+        f"{2**64}=10.77.0.2",
+        "0=10.77.0.2",
+        "5",
+        "5=10.77.0.x",
+        "5=192.168.1.2",
+        "5=10.77.0.0",
+        "5=10.77.0.255",
+        "5=10.77.0.2,5=10.77.0.3",
+        "5=10.77.0.2,6=10.77.0.2",
+    ],
+)
+def test_malformed_rosters(text):
+    assert roster.decode(text) is None
 
 
 def test_packet_messages_are_told_apart_by_their_first_byte():
@@ -49,9 +89,10 @@ def test_packet_messages_are_told_apart_by_their_first_byte():
     assert tunnel.packet_message(packet) == b"\x00" + packet
     assert tunnel.packet_payload(tunnel.packet_message(packet)) == packet
     assert tunnel.packet_payload(tunnel.packet_message(b"")) == b""
-    for control in (access.ACCEPTED, access.DENIED, access.auth_message("X"), b"", b"\x45"):
+    accepted = access.accepted_message("7K2QDM9XTE")
+    for control in (accepted, access.DENIED, access.LEAVE, access.auth_message("X"), b"", b"\x45"):
         assert tunnel.packet_payload(control) is None
-    assert access.parse_message(tunnel.packet_message(access.ACCEPTED)) is None
+    assert access.parse_message(tunnel.packet_message(accepted)) is None
 
 
 def test_destination_member():

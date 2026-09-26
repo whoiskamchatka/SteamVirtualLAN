@@ -8,7 +8,7 @@ The project is still very early in development.
 
 ## Status
 
-Nothing usable yet. The desktop app creates and joins Steam lobbies, connects the members to each other over Steam, gives every member a virtual IP address (10.77.0.x) on its own virtual network adapter and carries IPv4 packets between them. Carrying packets between two PCs has not been tested yet; broadcast and multicast (which many games use to find LAN servers) are not carried.
+Nothing usable yet. The desktop app creates and joins networks of Steam friends, connects the members to each other over Steam, gives every member a virtual IP address (10.77.0.x) on its own virtual network adapter and carries IPv4 packets directly between them. It keeps running in the notification area, remembers its network between runs and doesn't depend on the member that created the network. Carrying packets between two PCs has not been tested yet; broadcast and multicast (which many games use to find LAN servers) are not carried.
 
 Windows is the initial target.
 
@@ -34,30 +34,66 @@ The tests don't require Steam or the Steamworks SDK.
 
 ## Desktop app
 
-With Steam running and `steamworks/steam_api64.dll` in place as described below, start the app from the repository root:
+With Steam running and `steam_api64.dll` in place as described below, start the app from the repository root:
 
 ```powershell
 python -m steamlan
 ```
 
-Create Lobby starts a network and shows its Lobby ID and access code. Invite Steam Friend opens the Steam overlay, where you pick friends to invite; the invite carries the lobby and access code, and the friend accepts it in Steam while the app is open on their PC. Anyone else can join with Join Lobby, using the Lobby ID and access code. The access code only exists in the host's app, in the invites it sends and with the people it is given to, and the host checks it over the Steam connection; it is never stored in the lobby.
+Create Network starts a network and shows its Lobby ID and access code. Invite Steam Friend opens the Steam overlay, where you pick friends to invite; the invite carries the lobby and access code, and the friend accepts it in Steam while the app is open on their PC. Anyone else can join with Join Network, using the Lobby ID and access code. Every member of a network knows its access code and can invite others. The code only exists in the members' apps, their saved network state (see below) and the invites they send, and is checked over the encrypted Steam connection; it is never stored in the lobby.
 
-Creating or joining a network also brings up SteamVirtualLAN's virtual network adapter (see below). Windows asks for Administrator permission for it with its UAC prompt; the app itself, with Steam and the window, keeps running without Administrator rights, and only a small helper process started through the prompt owns the adapter. If the permission is not given, the app leaves the network again and says why.
+All members of a network are equal. The member list shows everyone's name, virtual IP address and whether they are Online or Offline; only your own row is marked, with "You".
 
-The host is always 10.77.0.1. The host gives every member it admits the next free address, 10.77.0.2, 10.77.0.3 and so on, and sends all members the same list of which Steam account has which address; members never choose their own. The member list shows each member's address.
+Going online in a network also brings up SteamVirtualLAN's virtual network adapter (see below). Windows asks for Administrator permission for it with its UAC prompt; the app itself, with Steam and the window, keeps running without Administrator rights, and only a small helper process started through the prompt owns the adapter. If the permission is not given, the app goes offline again and says why.
 
-Packets Windows sends to another member's address go into the adapter, through the helper to the app, and over the Steam connection to that member, whose app hands them to its own adapter and so to Windows. A member only accepts packets from the address the host gave the member that sent them, and only for its own address. Only IPv4 packets between two members' addresses are carried.
+Every member gets its own address, which it keeps until it leaves the network for good: the member that creates a network is 10.77.0.1, and the others get the lowest free address when they are first admitted. Packets Windows sends to another member's address go into the adapter, through the helper to the app, and over a direct Steam connection to that member, whose app hands them to its own adapter and so to Windows. They never pass through a third member. A member only accepts packets from the address that belongs to the member that sent them, and only for its own address. Only IPv4 packets between two members' addresses are carried.
 
-Leave Lobby or closing the window first removes the adapter and ends the helper, then leaves the lobby and closes the Steam connections.
+### Closing, going offline, exiting and leaving
+
+- **Closing the window** (X) only hides it. SteamVirtualLAN keeps running in the notification area and stays online: Steam, the lobby, the connections to the other members and the virtual adapter all keep going. Its tray icon's menu has Open SteamVirtualLAN, the current status, Go Offline or Go Online, Leave Network and Exit. Starting the app again while it runs only brings its window back.
+- **Go Offline** makes this PC unavailable in the network: the adapter is removed and the app leaves the Steam lobby and closes its connections, but you stay a member and keep your address. It stays offline, also across restarts, until you choose Go Online. Online and Offline are SteamVirtualLAN's own, unrelated to your status in Steam's friends list.
+- **Exit** (in the tray menu) stops the app: the adapter, the connections and Steam. It does not leave the network. The next time the app starts it goes back online in the same network, with the same address, by itself.
+- **Leave Network** leaves for good. The other members are told, so that your address is freed, and the app forgets the network; to come back you need an invite or the access code again. Leaving while offline goes online briefly, without the adapter, only to tell the network.
+
+### Saved network state
+
+The network you are in is saved in `%LOCALAPPDATA%\SteamVirtualLAN\state.json`, per Steam account: the lobby, a random ID that tells the network apart from any other lobby, the access code, the members and their addresses, and whether you were online. The file is versioned JSON; a file SteamVirtualLAN can't read or that has another version is set aside as `state.json.bak` instead of being overwritten. `STEAMLAN_STATE_DIR` puts it somewhere else.
+
+When the app starts, or you choose Go Online, it joins the saved lobby again. If the network still has you, you get your old address back without the access code. If Steam says the lobby no longer exists, or the lobby is now something else, the app says so and forgets the network.
+
+### How a network works without the member that created it
+
+A network is a Steam lobby. Some decisions need exactly one member to make them: admitting new members after checking their access code, giving them addresses, and taking members out when they leave for good. That member is always the one Steam considers the lobby's owner. It is an internal duty, not a role anyone sees, and nothing else depends on it; in particular, packets never go through it.
+
+Steamworks (checked against SDK 1.65, `ISteamMatchmaking` `SteamMatchMaking009`) guarantees that a lobby has exactly one owner among the members currently in it. When the owner leaves the lobby or loses its connection to Steam, Steam makes another member the owner by itself (`GetLobbyOwner`); which one isn't documented, and Steam never hands ownership back to someone who returns. Only the owner can change lobby metadata (`SetLobbyData`), which is where the list of members and their addresses is kept, including members who are offline. So when the member that created a network goes offline, the others go on talking to each other, a new owner carries on admitting members with the same list, and when the creator comes back it is an ordinary member with its old address. The rare case of Steam making a member the owner before it has been admitted is handled too: that member passes ownership on (`SetLobbyOwner`) to an online member of the network, and nobody accepts a member list from an owner they don't already trust.
+
+### What Steam lobbies can't do
+
+A Steam lobby only exists while somebody is in it: Steam destroys it when its last member leaves ("Once all the users have left, the lobby is automatically destroyed on the back-end"), and it can't be joined or recreated with the same ID afterwards. Steam's only lobbies that survive being empty (`k_ELobbyTypePrivateUnique`) can only be created through Steam's Web API with a publisher key, that is, from a server.
+
+So a network lasts as long as at least one of its members is online in it, whichever member that is. Once everyone is offline or has exited at the same time, the network is gone; the apps notice on their next start, tell you, and forget it, and someone has to create a new one. Networks that survive everybody being offline will need a small server of our own (or one with Steam Web API access) that remembers them. That is future work.
+
+Other limitations for now: a member that never comes back keeps its address until it leaves with Leave Network, and there is no way yet to remove it from the network; and a Steam lobby holds at most 8 members online at the same time.
 
 ## Testing with the real Steam API
 
-Valve's `steam_api64.dll` is not included in this repository and must not be committed. Copy it from the Steamworks SDK (`redistributable_bin/win64/`) into a `steamworks` directory at the repository root; git ignores that directory:
+Valve's `steam_api64.dll` is not included in this repository and must not be committed. Copy it from the Steamworks SDK (`redistributable_bin/win64/`) into the repository root, next to `pyproject.toml`; git ignores it there:
 
 ```text
-steamworks/
+SteamVirtualLAN/
+    pyproject.toml
     steam_api64.dll
 ```
+
+A packaged SteamVirtualLAN expects it next to its executable instead:
+
+```text
+SteamVirtualLAN/
+    SteamVirtualLAN.exe
+    steam_api64.dll
+```
+
+`STEAMLAN_STEAM_API_DIR` points the app and the scripts at another directory. Checkouts that kept the DLL in a `steamworks` directory need to move it.
 
 Steam reads the app ID from `steam_appid.txt` in the working directory. The app and the scripts write that file (`480`, Valve's Spacewar test app) into the repository root when it is missing or wrong, so always start them from there. Started from anywhere else they pass the app ID in the `SteamAppId` environment variable instead.
 

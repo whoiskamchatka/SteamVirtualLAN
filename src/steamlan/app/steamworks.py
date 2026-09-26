@@ -1,5 +1,9 @@
 """Where SteamVirtualLAN finds Steam: the local Steam DLL and the app ID.
 
+steam_api64.dll is Valve's and is never committed. A packaged
+SteamVirtualLAN.exe expects it next to itself; during development it goes in
+the repository root, the directory with pyproject.toml.
+
 Steam reads the app ID from steam_appid.txt in the process's working directory
 (not next to steam_api64.dll), or from the SteamAppId environment variable.
 SteamVirtualLAN is run from the repository root, so that is where it keeps
@@ -9,6 +13,7 @@ SteamAppId instead.
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 from steamlan.steam import STEAM_API_DLL, SteamClient, SteamInitError
@@ -20,13 +25,29 @@ APP_ID = 480
 APP_ID_FILE = "steam_appid.txt"
 
 
-def steamworks_dir() -> Path:
-    """Where steam_api64.dll lives: $STEAMLAN_STEAMWORKS or ./steamworks."""
-    return Path(os.environ.get("STEAMLAN_STEAMWORKS", "steamworks")).resolve()
+# The repository root, when running from a source checkout.
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def is_project_root(directory: Path) -> bool:
     return (directory / "pyproject.toml").is_file() and (directory / "src" / "steamlan").is_dir()
+
+
+def steam_api_dir() -> Path:
+    """The directory steam_api64.dll is loaded from.
+
+    $STEAMLAN_STEAM_API_DIR if set; next to the executable when packaged;
+    otherwise the repository root of the source checkout this code runs from,
+    or else the working directory.
+    """
+    override = os.environ.get("STEAMLAN_STEAM_API_DIR")
+    if override:
+        return Path(override).resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    if is_project_root(_SOURCE_ROOT):
+        return _SOURCE_ROOT
+    return Path.cwd().resolve()
 
 
 def ensure_steam_appid(directory: Path) -> Path:
@@ -62,8 +83,8 @@ def prepare_app_id(working_dir: Path | None = None) -> Path | None:
 
 
 def open_steam(directory: Path | None = None) -> SteamClient:
-    """Start the Steam API with the DLL from the steamworks directory."""
+    """Start the Steam API with steam_api64.dll from steam_api_dir()."""
     prepare_app_id()
-    steam = SteamClient((directory or steamworks_dir()) / STEAM_API_DLL)
+    steam = SteamClient((directory or steam_api_dir()) / STEAM_API_DLL)
     steam.start()
     return steam

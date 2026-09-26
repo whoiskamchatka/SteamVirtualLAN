@@ -520,3 +520,12 @@ def test_diagnostic_elevates_after_preparing_wintun(scripts, monkeypatch, tmp_pa
 
     assert scripts.adapter.main() == 0
     assert calls == ["wintun", ("elevate", ["--reply", "--pause"])]
+
+
+def test_scripts_load_steam_api_from_the_repository_root(scripts, monkeypatch):
+    monkeypatch.delenv("STEAMLAN_STEAM_API_DIR", raising=False)
+    monkeypatch.setattr(scripts.local, "prepare_app_id", lambda: None)
+
+    steam = scripts.local.local_client()
+
+    assert Path(steam.dll_path) == SCRIPTS.parent / "steam_api64.dll"

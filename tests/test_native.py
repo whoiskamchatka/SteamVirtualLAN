@@ -391,3 +391,19 @@ def test_game_rich_presence_join_requested_layout():
     assert GAME_RICH_PRESENCE_JOIN_REQUESTED == 300 + 37
     assert ctypes.sizeof(GameRichPresenceJoinRequested) == 8 + 256
     assert offsets(GameRichPresenceJoinRequested) == [0, 8]
+
+
+def test_lobby_owner_signatures():
+    lib = bind(mock.Mock())
+
+    assert lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+    ]
+    assert lib.SteamAPI_ISteamMatchmaking_GetLobbyOwner.restype is ctypes.c_uint64
+    assert lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+    ]
+    assert lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.restype is ctypes.c_bool

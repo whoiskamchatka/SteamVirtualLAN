@@ -1,3 +1,8 @@
+"""NetworkSession seen from one member, with a FakeSteam.
+
+test_app_coordination.py has whole networks of several members.
+"""
+
 from ipaddress import IPv4Address
 
 import pytest
@@ -15,15 +20,18 @@ from app_fakes import (
     status,
 )
 
-from steamlan.app import access, tunnel
-from steamlan.app.network import AUTH_TIMEOUT, MAX_FAILURES, NetworkSession
+from steamlan.app import access, roster, tunnel
+from steamlan.app.network import (
+    AUTH_TIMEOUT,
+    HAND_OFF_INTERVAL,
+    MAX_FAILURES,
+    NO_MEMBERS_ONLINE,
+    NetworkSession,
+)
 from steamlan.steam import ChatMemberStateChange, ConnectionState
 
 CODE = "7K2QDM9XTE"
-A1 = IPv4Address("10.77.0.1")
-A2 = IPv4Address("10.77.0.2")
-A3 = IPv4Address("10.77.0.3")
-A4 = IPv4Address("10.77.0.4")
+A1, A2, A3, A4 = (IPv4Address(f"10.77.0.{n}") for n in (1, 2, 3, 4))
 
 
 class Clock:
@@ -34,57 +42,81 @@ class Clock:
         return self.now
 
 
-def host_network(members=(HOST, GUEST), clock=None):
-    steam = FakeSteam(HOST, members, names={GUEST: "Guest", OTHER: "Other"})
-    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, HOST, CODE, clock or Clock())
-    return steam, network
-
-
-def connect_guest(steam, network):
-    """The host has the lower SteamID, so it connects to the guest."""
-    network.process([])
-    (connection,) = [call[1] for call in steam.called("connect_p2p") if call[0] == GUEST]
-    network.process([status(connection, ConnectionState.CONNECTED, GUEST)])
-    return connection
+def published(steam):
+    return roster.decode(steam.lobby_metadata.get(roster.ROSTER_KEY, ""))
 
 
 def views(network):
     return {view.steam_id: view for view in network.members()}
 
 
-def test_host_approves_correct_code():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
-    assert views(network)[GUEST].status == "Checking access code"
+# The coordinator: HOST owns the lobby.
+
+
+def coordinator(members=(HOST, GUEST), clock=None, known=None, code=CODE):
+    steam = FakeSteam(HOST, members, names={GUEST: "Guest", OTHER: "Other"})
+    network = NetworkSession(
+        steam, LOBBY, LISTEN_SOCKET, code, clock or Clock(), known=known or {HOST: A1}
+    )
+    return steam, network
+
+
+def connect(steam, network, steam_id):
+    """HOST has the lowest SteamID, so it connects to everyone else."""
+    network.process([])
+    connection = [call[1] for call in steam.called("connect_p2p") if call[0] == steam_id][-1]
+    network.process([status(connection, ConnectionState.CONNECTED, steam_id)])
+    return connection
+
+
+def admit(steam, network, steam_id, code=CODE, preferred=None):
+    connection = connect(steam, network, steam_id)
+    steam.inbox[connection] = [access.auth_message(code, preferred)]
+    network.process([])
+    return connection
+
+
+def test_creator_is_the_first_member_and_publishes_the_roster():
+    steam, network = coordinator(members=(HOST,))
+
+    network.process([])
+
+    assert network.joined and network.is_coordinator
+    assert network.local_address == A1
+    assert published(steam) == {HOST: A1}
+    assert network.status() == ("Online", "ok")
+    (me,) = network.members()
+    assert (me.is_you, me.online, me.status, me.address) == (True, True, "Online", "10.77.0.1")
+
+
+def test_coordinator_admits_correct_code_and_shares_it():
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
+    assert views(network)[GUEST].status == "Joining"
 
     steam.inbox[connection] = [access.auth_message(CODE)]
     network.process([])
 
-    assert network.approved == {GUEST}
-    assert steam.sent[0] == (connection, access.ACCEPTED)
-    assert steam.sent[1] == (connection, access.members_message({HOST: A1, GUEST: A2}))
-    assert views(network)[GUEST].status == "Connected"
-    assert network.status() == ("Connected to 1 of 1", "ok")
+    assert network.roster == {HOST: A1, GUEST: A2}
+    assert published(steam) == {HOST: A1, GUEST: A2}
+    assert steam.sent == [(connection, access.accepted_message(CODE))]
+    guest = views(network)[GUEST]
+    assert (guest.status, guest.online, guest.address) == ("Online", True, "10.77.0.2")
 
 
-def test_host_denies_wrong_code():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
+def test_coordinator_denies_wrong_code():
+    steam, network = coordinator()
+    connection = admit(steam, network, GUEST, code="AAAAAAAAAA")
 
-    steam.inbox[connection] = [access.auth_message("AAAAAAAAAA")]
-    network.process([])
-
-    assert network.approved == set()
+    assert network.roster == {HOST: A1}
     assert steam.sent == [(connection, access.DENIED)]
     assert steam.closed == [(connection, True)]
-    assert views(network)[GUEST].status == "Access denied"
+    assert GUEST not in views(network)
 
 
-def test_host_does_not_reconnect_to_denied_member():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
-    steam.inbox[connection] = [access.auth_message("AAAAAAAAAA")]
-    network.process([])
+def test_coordinator_does_not_reconnect_to_denied_member():
+    steam, network = coordinator()
+    admit(steam, network, GUEST, code="AAAAAAAAAA")
 
     network.process([])
     network.process([])
@@ -92,22 +124,20 @@ def test_host_does_not_reconnect_to_denied_member():
     assert len(steam.called("connect_p2p")) == 1
 
 
-def test_host_stops_checking_after_too_many_failures():
-    steam, network = host_network(members=(GUEST, HOST))
+def test_coordinator_stops_checking_after_too_many_failures():
+    steam, network = coordinator()
     network._failures[GUEST] = MAX_FAILURES
-    connection = connect_guest(steam, network)
 
-    steam.inbox[connection] = [access.auth_message(CODE)]
-    network.process([])
+    connection = admit(steam, network, GUEST)
 
-    assert network.approved == set()
+    assert network.roster == {HOST: A1}
     assert steam.sent == [(connection, access.DENIED)]
 
 
-def test_host_denies_member_that_sends_no_code():
+def test_coordinator_denies_member_that_sends_no_code():
     clock = Clock()
-    steam, network = host_network(clock=clock)
-    connection = connect_guest(steam, network)
+    steam, network = coordinator(clock=clock)
+    connection = connect(steam, network, GUEST)
 
     clock.now = AUTH_TIMEOUT - 1
     network.process([])
@@ -118,317 +148,434 @@ def test_host_denies_member_that_sends_no_code():
     assert steam.closed == [(connection, True)]
 
 
-def test_host_ignores_other_data_and_repeated_auth():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
-    steam.inbox[connection] = [b"hello", access.auth_message(CODE), access.auth_message("XXXX")]
+def test_coordinator_without_a_code_admits_nobody_new():
+    steam, network = coordinator(code="")
+
+    connection = admit(steam, network, GUEST, code="")
+
+    assert network.roster == {HOST: A1}
+    assert steam.sent == [(connection, access.DENIED)]
+
+
+def test_coordinator_ignores_other_data():
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
+    steam.inbox[connection] = [b"hello", b"SVL1 AUTH " + CODE.encode()]
 
     network.process([])
 
-    assert network.approved == {GUEST}
-    assert [data for _, data in steam.sent].count(access.ACCEPTED) == 1
-    assert access.DENIED not in [data for _, data in steam.sent]
+    assert network.roster == {HOST: A1}
+    assert steam.sent == []
 
 
-def test_host_forgets_member_that_leaves():
-    steam, network = host_network(members=(HOST, GUEST, OTHER))
-    connection = connect_guest(steam, network)
-    other = [call[1] for call in steam.called("connect_p2p") if call[0] == OTHER][0]
-    network.process([status(other, ConnectionState.CONNECTED, OTHER)])
-    steam.inbox[connection] = [access.auth_message(CODE)]
-    steam.inbox[other] = [access.auth_message(CODE)]
+def test_addresses_follow_the_order_members_are_admitted():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
+
+    admit(steam, network, OTHER)
+    admit(steam, network, GUEST)
+
+    assert network.roster == {HOST: A1, OTHER: A2, GUEST: A3}
+    assert [view.address for view in network.members()] == ["10.77.0.1", "10.77.0.2", "10.77.0.3"]
+
+
+def test_member_going_offline_keeps_its_address():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
+    admit(steam, network, GUEST)
+
+    steam.members.remove(GUEST)
+    network.process([member_update(GUEST, ChatMemberStateChange.DISCONNECTED)])
+    admit(steam, network, OTHER)
+
+    assert network.roster == {HOST: A1, GUEST: A2, OTHER: A3}
+    assert published(steam) == {HOST: A1, GUEST: A2, OTHER: A3}
+    guest = views(network)[GUEST]
+    assert (guest.online, guest.status, guest.tone, guest.address) == (
+        False,
+        "Offline",
+        "neutral",
+        "10.77.0.2",
+    )
+
+
+def test_returning_member_is_admitted_by_its_steam_id_with_its_old_address():
+    steam, network = coordinator(members=(HOST,), known={HOST: A1, GUEST: A2})
     network.process([])
+    assert published(steam) == {HOST: A1, GUEST: A2}
+
+    steam.members.append(GUEST)
+    network.process([member_update(GUEST)])
+    connection = admit(steam, network, GUEST, code="")
+
+    assert network.roster == {HOST: A1, GUEST: A2}
+    assert steam.sent == [(connection, access.accepted_message(CODE))]
+
+
+def test_explicit_leave_frees_the_address():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
+    guest = admit(steam, network, GUEST)
+    admit(steam, network, OTHER)
+
+    steam.inbox[guest] = [access.LEAVE]
+    network.process([])
+
+    assert network.roster == {HOST: A1, OTHER: A3}
+    assert published(steam) == {HOST: A1, OTHER: A3}
+
+    steam.members.remove(GUEST)
+    steam.members.append(STRANGER)
+    network.process([member_update(GUEST, ChatMemberStateChange.LEFT), member_update(STRANGER)])
+    admit(steam, network, STRANGER)
+    assert network.roster[STRANGER] == A2
+
+
+def test_leave_from_someone_outside_the_roster_changes_nothing():
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
+
+    steam.inbox[connection] = [access.LEAVE]
+    network.process([])
+
+    assert network.left == set()
+
+
+def test_new_member_gets_its_preferred_address_when_free():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
+
+    admit(steam, network, GUEST, preferred=A4)
+    admit(steam, network, OTHER, preferred=A4)
+
+    assert network.roster == {HOST: A1, GUEST: A4, OTHER: A2}
+
+
+def test_network_full():
+    steam, network = coordinator()
+    network.roster.update(
+        {steam_id: IPv4Address(f"10.77.0.{steam_id}") for steam_id in range(2, 255)}
+    )
+
+    connection = admit(steam, network, GUEST)
+
+    assert GUEST not in network.roster
+    assert steam.sent == [(connection, access.DENIED)]
+
+
+def test_coordinator_leaving_takes_itself_out_first():
+    steam, network = coordinator()
+    connection = admit(steam, network, GUEST)
     steam.sent.clear()
 
-    steam.members.remove(OTHER)
-    network.process([member_update(OTHER, ChatMemberStateChange.LEFT)])
+    assert network.announce_leave()
 
-    assert network.approved == {GUEST}
-    assert OTHER not in views(network)
-    assert steam.sent == [(connection, access.members_message({HOST: A1, GUEST: A2}))]
+    assert published(steam) == {GUEST: A2}
+    assert steam.sent == [(connection, access.LEAVE)]
 
 
-def test_duplicate_member_updates_show_one_row():
-    steam, network = host_network(members=(HOST,))
-    steam.members.append(GUEST)
-
-    network.process([member_update(GUEST)])
-    network.process([member_update(GUEST), member_update(GUEST)])
-
-    assert [view.steam_id for view in network.members()] == [HOST, GUEST]
+# A member: HOST owns the lobby, GUEST is this member.
 
 
-def test_host_status_without_peers():
-    steam, network = host_network(members=(HOST,))
-
-    assert network.status() == ("Waiting for peers", "neutral")
-    (me,) = network.members()
-    assert (me.is_you, me.is_host, me.status) == (True, True, "Hosting")
-
-
-def test_unknown_names_use_a_placeholder():
-    steam, network = host_network(members=(HOST, STRANGER))
-
-    assert views(network)[STRANGER].name == f"Steam user {str(STRANGER)[-4:]}"
-
-
-def guest_network(code=CODE, clock=None):
-    steam = FakeSteam(GUEST, [HOST, GUEST], names={HOST: "Host"})
-    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, HOST, code, clock or Clock())
+def member(code=CODE, clock=None, known=None, preferred=None, members=(HOST, GUEST)):
+    steam = FakeSteam(GUEST, members, names={HOST: "Host", OTHER: "Other"})
+    network = NetworkSession(
+        steam,
+        LOBBY,
+        LISTEN_SOCKET,
+        code,
+        clock or Clock(),
+        known=known,
+        preferred=preferred,
+    )
     return steam, network
 
 
-def connect_to_host(steam, network, connection=7):
+def connect_to_owner(steam, network, connection=7):
     network.process([incoming(connection, HOST)])
     network.process([status(connection, ConnectionState.CONNECTED, HOST, LISTEN_SOCKET)])
     return connection
 
 
-def test_guest_sends_code_once_connected():
-    steam, network = guest_network()
+def accepted(steam, network, addresses=None, connection=7):
+    """The coordinator admits this member: it writes the roster, then answers."""
+    connect_to_owner(steam, network, connection)
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode(addresses or {HOST: A1, GUEST: A2})
+    steam.inbox[connection] = [access.accepted_message(CODE)]
+    network.process([])
+    steam.sent.clear()
+    return connection
+
+
+def test_member_sends_code_once_connected_to_the_coordinator():
+    steam, network = member()
     network.process([])
     assert steam.sent == []
-    assert network.status() == ("Connecting to host", "pending")
+    assert network.status() == ("Connecting to the network...", "pending")
 
-    connection = connect_to_host(steam, network)
+    connection = connect_to_owner(steam, network)
     network.process([])
 
     assert steam.sent == [(connection, access.auth_message(CODE))]
     assert views(network)[GUEST].status == "Joining"
 
 
-def test_guest_is_joined_after_host_accepts():
-    steam, network = guest_network()
-    connection = connect_to_host(steam, network)
+def test_member_joins_with_the_roster_after_being_accepted():
+    steam, network = member(code="")
 
-    steam.inbox[connection] = [
-        access.ACCEPTED,
-        access.members_message({HOST: A1, GUEST: A2, OTHER: A3}),
-    ]
-    network.process([])
+    accepted(steam, network, {HOST: A1, OTHER: A2, GUEST: A3})
 
     assert network.joined
-    assert network.approved == {HOST, OTHER}
-    assert network.status() == ("Connected", "ok")
-    assert views(network)[HOST].status == "Connected"
-    assert views(network)[GUEST].status == "Connected"
+    assert network.local_address == A3
+    assert network.access_code == CODE
+    assert network.status() == ("Online", "ok")
+    other = views(network)[OTHER]
+    assert (other.online, other.status, other.address) == (False, "Offline", "10.77.0.2")
 
 
-def test_guest_refused_by_host():
-    steam, network = guest_network()
-    connection = connect_to_host(steam, network)
+def test_member_ignores_the_roster_until_the_coordinator_accepted_it():
+    steam, network = member()
+    connect_to_owner(steam, network)
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2})
 
-    steam.inbox[connection] = [access.DENIED]
     network.process([])
 
-    assert network.refused == "Incorrect access code"
     assert not network.joined
 
 
-def test_guest_gives_up_when_host_does_not_answer():
-    clock = Clock()
-    steam, network = guest_network(clock=clock)
-    connect_to_host(steam, network)
-
-    clock.now = AUTH_TIMEOUT + 1
-    network.process([])
-
-    assert network.refused == "The host did not answer"
-
-
-def test_guest_ignores_access_messages_from_other_members():
-    steam = FakeSteam(GUEST, [HOST, GUEST, STRANGER])
-    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, HOST, CODE, Clock())
-    connect_to_host(steam, network)
+def test_member_ignores_answers_from_members_that_do_not_coordinate():
+    steam, network = member(members=(HOST, GUEST, STRANGER))
+    connect_to_owner(steam, network)
     stranger = [call[1] for call in steam.called("connect_p2p") if call[0] == STRANGER][0]
     network.process([status(stranger, ConnectionState.CONNECTED, STRANGER)])
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({STRANGER: A1, GUEST: A2})
 
-    steam.inbox[stranger] = [access.ACCEPTED, access.DENIED]
+    steam.inbox[stranger] = [access.accepted_message(CODE), access.DENIED]
     network.process([])
 
     assert not network.joined
     assert not network.refused
 
 
-def test_guest_sees_host_leave():
-    steam, network = guest_network()
-    connect_to_host(steam, network)
+def test_member_refused():
+    steam, network = member()
+    connection = connect_to_owner(steam, network)
 
-    steam.members.remove(HOST)
-    network.process([member_update(HOST, ChatMemberStateChange.LEFT)])
-
-    assert network.status() == ("Host left the network", "error")
-
-
-def test_close_closes_connections():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
-
-    network.close()
-
-    assert steam.closed == [(connection, False)]
-
-
-@pytest.mark.parametrize(
-    "state", [ConnectionState.CLOSED_BY_PEER, ConnectionState.PROBLEM_DETECTED_LOCALLY]
-)
-def test_lost_connection(state):
-    steam, network = guest_network()
-    connection = connect_to_host(steam, network)
-    steam.inbox[connection] = [access.ACCEPTED]
+    steam.inbox[connection] = [access.DENIED]
     network.process([])
 
-    network.process([status(connection, state, HOST, LISTEN_SOCKET)])
-
-    assert network.status() == ("Connection lost", "error")
-    assert views(network)[HOST].status == "Connection lost"
+    assert network.refused == "Incorrect access code"
+    assert network.status() == ("Incorrect access code", "error")
 
 
 def test_member_without_code_is_told_to_ask_for_one():
-    steam, network = guest_network(code="")
-    connection = connect_to_host(steam, network)
+    steam, network = member(code="")
+    connection = connect_to_owner(steam, network)
     network.process([])
     assert steam.sent == [(connection, access.auth_message(""))]
 
     steam.inbox[connection] = [access.DENIED]
     network.process([])
 
-    assert network.refused == "Ask the host for an invite or the access code"
+    assert network.refused == "Ask a member of the network for an invite or the access code"
 
 
-def test_host_denies_member_without_code():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
-
-    steam.inbox[connection] = [access.auth_message("")]
+def test_member_gives_up_when_the_coordinator_does_not_answer():
+    clock = Clock()
+    steam, network = member(clock=clock)
+    connect_to_owner(steam, network)
     network.process([])
 
-    assert network.approved == set()
-    assert steam.sent == [(connection, access.DENIED)]
-
-
-def admit(steam, network, steam_id):
-    """Connect a member to the host and let it present the right code."""
-    network.process([])
-    (connection,) = [call[1] for call in steam.called("connect_p2p") if call[0] == steam_id]
-    network.process([status(connection, ConnectionState.CONNECTED, steam_id)])
-    steam.inbox[connection] = [access.auth_message(CODE)]
-    network.process([])
-    return connection
-
-
-def test_host_is_always_the_first_address():
-    steam, network = host_network(members=(HOST,))
-
-    assert network.local_address == A1
-    assert network.addresses == {HOST: A1}
-    assert views(network)[HOST].address == "10.77.0.1"
-
-
-def test_host_assigns_addresses_in_the_order_members_are_admitted():
-    steam, network = host_network(members=(HOST, GUEST, OTHER))
-
-    assert views(network)[GUEST].address == ""
-    other = admit(steam, network, OTHER)
-    guest = admit(steam, network, GUEST)
-
-    assert network.addresses == {HOST: A1, OTHER: A2, GUEST: A3}
-    assert views(network)[OTHER].address == "10.77.0.2"
-    assert views(network)[GUEST].address == "10.77.0.3"
-    # Everyone admitted gets the same, complete mapping.
-    everyone = access.members_message({HOST: A1, OTHER: A2, GUEST: A3})
-    assert (other, everyone) in steam.sent
-    assert (guest, everyone) in steam.sent
-
-
-def test_member_that_is_not_admitted_gets_no_address():
-    steam, network = host_network()
-    connect_guest(steam, network)
-
-    assert network.addresses == {HOST: A1}
-    assert views(network)[GUEST].address == ""
-
-
-def test_address_of_a_member_that_left_is_given_out_again():
-    steam, network = host_network(members=(HOST, GUEST, OTHER))
-    admit(steam, network, GUEST)
-    other = admit(steam, network, OTHER)
-    steam.sent.clear()
-
-    steam.members.remove(GUEST)
-    network.process([member_update(GUEST, ChatMemberStateChange.LEFT)])
-
-    assert network.addresses == {HOST: A1, OTHER: A3}
-    assert steam.sent == [(other, access.members_message({HOST: A1, OTHER: A3}))]
-
-    steam.members.append(STRANGER)
-    network.process([member_update(STRANGER)])
-    admit(steam, network, STRANGER)
-    assert network.addresses == {HOST: A1, OTHER: A3, STRANGER: A2}
-
-
-def admitted_guest(addresses=None):
-    steam, network = guest_network()
-    connection = connect_to_host(steam, network)
-    steam.inbox[connection] = [
-        access.ACCEPTED,
-        access.members_message(addresses or {HOST: A1, GUEST: A2}),
-    ]
-    network.process([])
-    steam.sent.clear()
-    return steam, network, connection
-
-
-def test_guest_learns_every_address_from_the_host():
-    steam, network, _ = admitted_guest({HOST: A1, OTHER: A2, GUEST: A3})
-
-    assert network.local_address == A3
-    assert network.addresses == {HOST: A1, OTHER: A2, GUEST: A3}
-    assert views(network)[HOST].address == "10.77.0.1"
-    assert views(network)[GUEST].address == "10.77.0.3"
-
-
-def test_guest_has_no_address_until_the_host_assigns_one():
-    steam, network = guest_network()
-    connect_to_host(steam, network)
-
-    assert network.local_address is None
-    assert views(network)[GUEST].address == ""
-
-
-def test_guest_ignores_address_lists_from_other_members():
-    steam = FakeSteam(GUEST, [HOST, GUEST, STRANGER])
-    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, HOST, CODE, Clock())
-    connect_to_host(steam, network)
-    stranger = [call[1] for call in steam.called("connect_p2p") if call[0] == STRANGER][0]
-    network.process([status(stranger, ConnectionState.CONNECTED, STRANGER)])
-
-    steam.inbox[stranger] = [access.members_message({HOST: A1, GUEST: A2, STRANGER: A3})]
+    clock.now = AUTH_TIMEOUT + 1
     network.process([])
 
-    assert network.addresses == {}
-    assert network.local_address is None
+    assert network.refused == "The network did not answer"
+
+
+def test_member_asks_the_new_coordinator_when_coordination_moves():
+    steam, network = member(members=(HOST, GUEST, OTHER))
+    host = connect_to_owner(steam, network)
+    other = [call[1] for call in steam.called("connect_p2p") if call[0] == OTHER][0]
+    network.process([status(other, ConnectionState.CONNECTED, OTHER)])
+    assert steam.sent == [(host, access.auth_message(CODE))]
+
+    steam.owner = OTHER
+    steam.members.remove(HOST)
+    network.process([member_update(HOST, ChatMemberStateChange.DISCONNECTED)])
+
+    assert steam.sent[-1] == (other, access.auth_message(CODE))
+    assert network.coordinator_id == OTHER
+
+
+def test_returning_member_takes_its_address_back_from_the_lobby():
+    steam, network = member(known={HOST: A1, GUEST: A2})
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2, OTHER: A3})
+
+    network.process([])
+
+    assert network.joined
+    assert network.local_address == A2
+    assert steam.sent == []
+
+
+def test_returning_member_that_was_taken_out_asks_for_its_old_address():
+    steam, network = member(known={HOST: A1, GUEST: A2}, preferred=A2)
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1})
+    connection = connect_to_owner(steam, network)
+    network.process([])
+
+    assert not network.joined
+    assert steam.sent == [(connection, access.auth_message(CODE, A2))]
+
+
+def test_member_ignores_a_roster_that_moves_it():
+    steam, network = member()
+    accepted(steam, network)
+
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A3})
+    network.process([])
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1})
+    network.process([])
+
+    assert network.roster == {HOST: A1, GUEST: A2}
+
+
+def test_member_ignores_a_roster_written_by_an_owner_it_does_not_trust():
+    steam, network = member(members=(HOST, GUEST, STRANGER))
+    accepted(steam, network)
+
+    steam.owner = STRANGER
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2, STRANGER: A3})
+    network.process([])
+
+    assert network.roster == {HOST: A1, GUEST: A2}
+    assert network.coordinator_id == STRANGER
+
+
+def test_member_takes_over_with_the_last_roster_when_steam_makes_it_the_owner():
+    steam, network = member(members=(HOST, GUEST, OTHER))
+    accepted(steam, network)
+    # The coordinator admits OTHER and leaves; both arrive together.
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2, OTHER: A3})
+    steam.owner = GUEST
+    steam.members.remove(HOST)
+    network.process([member_update(HOST, ChatMemberStateChange.LEFT)])
+
+    assert network.is_coordinator
+    assert network.roster == {HOST: A1, GUEST: A2, OTHER: A3}
+    assert published(steam) == {HOST: A1, GUEST: A2, OTHER: A3}
+
+
+def test_owner_that_is_not_a_member_hands_the_network_on():
+    clock = Clock()
+    steam = FakeSteam(STRANGER, [OTHER, GUEST, STRANGER])
+    steam.owner = STRANGER
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2, OTHER: A3})
+    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, CODE, clock)
+
+    network.process([])
+    network.process([])
+
+    assert steam.called("set_lobby_owner") == [(LOBBY, GUEST)]
+    assert not network.is_coordinator
+    assert not network.refused
+
+
+def test_owner_that_is_not_a_member_retries_the_hand_off():
+    clock = Clock()
+    steam = FakeSteam(STRANGER, [GUEST, STRANGER])
+    steam.owner = STRANGER
+    steam.fail.add("set_lobby_owner")
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({GUEST: A2})
+    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, CODE, clock)
+
+    network.process([])
+    network.process([])
+    assert steam.called("set_lobby_owner") == []
+    steam.fail.clear()
+    clock.now = HAND_OFF_INTERVAL + 1
+    network.process([])
+
+    assert steam.called("set_lobby_owner") == [(LOBBY, GUEST)]
+
+
+def test_owner_that_is_not_a_member_with_nobody_to_hand_to():
+    steam = FakeSteam(STRANGER, [STRANGER])
+    steam.owner = STRANGER
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2})
+    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, CODE, Clock())
+
+    network.process([])
+
+    assert network.refused == NO_MEMBERS_ONLINE
+    assert steam.called("set_lobby_owner") == []
+
+
+def test_member_leaving_tells_the_coordinator():
+    steam, network = member()
+    connection = accepted(steam, network)
+
+    assert network.announce_leave()
+
+    assert steam.sent == [(connection, access.LEAVE)]
+
+
+def test_member_leaving_waits_until_it_can_tell_the_coordinator():
+    steam, network = member(known={HOST: A1, GUEST: A2})
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2})
+    network.process([])
+
+    assert not network.announce_leave()
+    connect_to_owner(steam, network)
+    assert network.announce_leave()
+
+
+def test_close_closes_connections():
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
+
+    network.close(linger=True)
+
+    assert steam.closed == [(connection, True)]
 
 
 @pytest.mark.parametrize(
-    "addresses",
-    [
-        {GUEST: A2, OTHER: A1},  # without the host
-        {HOST: A1, GUEST: A3},  # moves this member to another address
-    ],
-    ids=["no host", "own address changed"],
+    "state", [ConnectionState.CLOSED_BY_PEER, ConnectionState.PROBLEM_DETECTED_LOCALLY]
 )
-def test_guest_ignores_address_lists_that_do_not_fit(addresses):
-    steam, network, connection = admitted_guest()
+def test_lost_connection_to_a_member_that_is_still_there(state):
+    steam, network = member()
+    connection = accepted(steam, network)
 
-    steam.inbox[connection] = [access.members_message(addresses)]
-    network.process([])
+    network.process([status(connection, state, HOST, LISTEN_SOCKET)])
 
-    assert network.addresses == {HOST: A1, GUEST: A2}
+    host = views(network)[HOST]
+    assert (host.status, host.online) == ("Connecting", True)
+    assert network.status() == ("Online", "ok")
 
 
-def test_host_sends_packet_to_the_member_that_owns_the_destination():
-    steam, network = host_network(members=(HOST, GUEST, OTHER))
+def test_unknown_names_use_a_placeholder_and_known_ones_are_remembered():
+    steam, network = coordinator(members=(HOST, STRANGER, GUEST))
+    admit(steam, network, GUEST)
+    assert views(network)[STRANGER].name == f"Steam user {str(STRANGER)[-4:]}"
+    assert views(network)[GUEST].name == "Guest"
+
+    del steam.names[GUEST]
+    steam.members.remove(GUEST)
+    network.process([member_update(GUEST, ChatMemberStateChange.LEFT)])
+
+    assert views(network)[GUEST].name == "Guest"
+    assert network.names[GUEST] == "Guest"
+
+
+def test_member_list_has_no_special_roles():
+    steam, network = member()
+    accepted(steam, network)
+
+    assert [(v.name, v.is_you) for v in network.members()] == [("Me", True), ("Host", False)]
+    assert not hasattr(network.members()[0], "is_host")
+
+
+# Packets
+
+
+def test_coordinator_sends_packets_to_the_member_that_owns_the_destination():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
     guest = admit(steam, network, GUEST)
     other = admit(steam, network, OTHER)
     to_guest = ipv4_packet(A1, A2)
@@ -468,8 +615,8 @@ def test_host_sends_packet_to_the_member_that_owns_the_destination():
         "empty",
     ],
 )
-def test_host_drops_packets_it_cannot_route(packet):
-    steam, network = host_network()
+def test_packets_that_cannot_be_routed_are_dropped(packet):
+    steam, network = coordinator()
     admit(steam, network, GUEST)
 
     assert not network.send_packet(packet)
@@ -477,30 +624,38 @@ def test_host_drops_packets_it_cannot_route(packet):
     assert network.dropped_packets == 1
 
 
-def test_packets_go_only_to_admitted_members():
-    steam, network = host_network()
-    connect_guest(steam, network)
+def test_packets_go_only_to_members():
+    steam, network = coordinator()
+    connect(steam, network, GUEST)
 
     assert not network.send_packet(ipv4_packet(A1, A2))
     assert steam.unreliable == []
 
 
-def test_guest_cannot_send_before_it_has_an_address():
-    steam, network = guest_network()
-    connect_to_host(steam, network)
+def test_packets_for_an_offline_member_are_dropped():
+    steam, network = coordinator()
+    admit(steam, network, GUEST)
+    steam.members.remove(GUEST)
+    network.process([member_update(GUEST, ChatMemberStateChange.LEFT)])
+
+    assert not network.send_packet(ipv4_packet(A1, A2))
+    assert network.dropped_packets == 1
+
+
+def test_member_cannot_send_before_it_has_an_address():
+    steam, network = member()
+    connect_to_owner(steam, network)
 
     assert not network.send_packet(ipv4_packet(A2, A1))
     assert steam.unreliable == []
 
 
-def test_guest_sends_to_other_members_directly():
-    steam = FakeSteam(GUEST, [HOST, GUEST, OTHER])
-    network = NetworkSession(steam, LOBBY, LISTEN_SOCKET, HOST, CODE, Clock())
-    host = connect_to_host(steam, network)
+def test_members_send_to_each_other_directly_not_through_the_coordinator():
+    steam, network = member(members=(HOST, GUEST, OTHER))
+    host = connect_to_owner(steam, network)
     (other,) = [call[1] for call in steam.called("connect_p2p") if call[0] == OTHER]
     network.process([status(other, ConnectionState.CONNECTED, OTHER)])
-    steam.inbox[host] = [access.ACCEPTED, access.members_message({HOST: A1, GUEST: A2, OTHER: A3})]
-    network.process([])
+    accepted(steam, network, {HOST: A1, GUEST: A2, OTHER: A3}, connection=host)
 
     assert network.send_packet(ipv4_packet(A2, A3))
     assert network.send_packet(ipv4_packet(A2, A1))
@@ -509,15 +664,16 @@ def test_guest_sends_to_other_members_directly():
 
 
 def test_packets_are_not_sent_while_the_connection_is_down():
-    steam, network = host_network()
+    steam, network = coordinator()
     guest = admit(steam, network, GUEST)
     network.process([status(guest, ConnectionState.CLOSED_BY_PEER, GUEST)])
 
     assert not network.send_packet(ipv4_packet(A1, A2))
 
 
-def test_guest_accepts_packets_from_their_owner():
-    steam, network, connection = admitted_guest()
+def test_member_accepts_packets_from_their_owner():
+    steam, network = member()
+    connection = accepted(steam, network)
     packet = ipv4_packet(A1, A2)
 
     steam.inbox[connection] = [tunnel.packet_message(packet)]
@@ -530,7 +686,7 @@ def test_guest_accepts_packets_from_their_owner():
 @pytest.mark.parametrize(
     "packet",
     [
-        ipv4_packet(A3, A2),  # the host pretending to be another member
+        ipv4_packet(A3, A2),  # pretending to be another member
         ipv4_packet(A1, A3),  # addressed to someone else
         ipv4_packet(A1, "10.77.0.255"),
         ipv4_packet("192.168.1.1", A2),
@@ -539,8 +695,9 @@ def test_guest_accepts_packets_from_their_owner():
     ],
     ids=["spoofed source", "other destination", "broadcast", "outside", "truncated", "ipv6"],
 )
-def test_guest_drops_packets_that_do_not_fit_their_sender(packet):
-    steam, network, connection = admitted_guest({HOST: A1, GUEST: A2, OTHER: A3})
+def test_member_drops_packets_that_do_not_fit_their_sender(packet):
+    steam, network = member()
+    connection = accepted(steam, network, {HOST: A1, GUEST: A2, OTHER: A3})
 
     steam.inbox[connection] = [tunnel.packet_message(packet)]
     network.process([])
@@ -549,9 +706,9 @@ def test_guest_drops_packets_that_do_not_fit_their_sender(packet):
     assert network.dropped_packets == 1
 
 
-def test_host_drops_packets_from_members_it_has_not_admitted():
-    steam, network = host_network()
-    connection = connect_guest(steam, network)
+def test_coordinator_drops_packets_from_members_it_has_not_admitted():
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
 
     steam.inbox[connection] = [tunnel.packet_message(ipv4_packet(A2, A1))]
     network.process([])
@@ -560,67 +717,19 @@ def test_host_drops_packets_from_members_it_has_not_admitted():
 
 
 def test_packets_and_control_messages_never_mix():
-    steam, network = guest_network()
-    connection = connect_to_host(steam, network)
+    steam, network = member()
+    connection = connect_to_owner(steam, network)
 
     # A packet whose bytes spell a control message is still only a packet, and
-    # isn't even delivered: the guest has no address yet.
-    steam.inbox[connection] = [tunnel.packet_message(access.ACCEPTED)]
+    # isn't even delivered: the member has no address yet.
+    steam.inbox[connection] = [tunnel.packet_message(access.accepted_message(CODE))]
     network.process([])
-    assert not network.joined
-    assert network.take_packets() == []
+    assert network.access_code == CODE and network.take_packets() == []
+    assert network.coordinator_id not in network._trusted
 
     # A control message is never taken for a packet.
-    steam.inbox[connection] = [access.ACCEPTED, access.members_message({HOST: A1, GUEST: A2})]
+    steam.lobby_metadata[roster.ROSTER_KEY] = roster.encode({HOST: A1, GUEST: A2})
+    steam.inbox[connection] = [access.accepted_message(CODE)]
     network.process([])
     assert network.joined
     assert network.take_packets() == []
-
-
-class Wire:
-    """Carries the messages two FakeSteams send each other over one connection."""
-
-    def __init__(self, a, a_connection, b, b_connection):
-        self.ends = [(a, a_connection, b, b_connection), (b, b_connection, a, a_connection)]
-
-    def deliver(self):
-        for source, source_connection, target, target_connection in self.ends:
-            for kind in ("sent", "unreliable"):
-                queue = getattr(source, kind)
-                for connection, data in list(queue):
-                    if connection == source_connection:
-                        target.inbox.setdefault(target_connection, []).append(data)
-                        queue.remove((connection, data))
-
-
-def test_packets_cross_between_host_and_member():
-    """PC A 10.77.0.1 pings PC B 10.77.0.2, and B's reply comes back, as bytes."""
-    host_steam, host = host_network()
-    guest_steam, guest = guest_network()
-    host.process([])
-    (host_side,) = [c[1] for c in host_steam.called("connect_p2p") if c[0] == GUEST]
-    guest.process([incoming(9, HOST)])
-    host.process([status(host_side, ConnectionState.CONNECTED, GUEST)])
-    guest.process([status(9, ConnectionState.CONNECTED, HOST, LISTEN_SOCKET)])
-    wire = Wire(host_steam, host_side, guest_steam, 9)
-    for _ in range(3):
-        guest.process([])
-        wire.deliver()
-        host.process([])
-        wire.deliver()
-
-    assert guest.joined
-    assert (host.local_address, guest.local_address) == (A1, A2)
-    assert host.addresses == guest.addresses == {HOST: A1, GUEST: A2}
-
-    request = ipv4_packet(A1, A2, b"echo request")
-    assert host.send_packet(request)
-    wire.deliver()
-    guest.process([])
-    assert guest.take_packets() == [request]
-
-    reply = ipv4_packet(A2, A1, b"echo reply")
-    assert guest.send_packet(reply)
-    wire.deliver()
-    host.process([])
-    assert host.take_packets() == [reply]
