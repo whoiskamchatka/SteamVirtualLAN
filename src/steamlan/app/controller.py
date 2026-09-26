@@ -11,13 +11,28 @@ remembers between runs (state.py). In a network, this PC is:
 
 Leave Network is the only way out of a network: it tells the network so that
 the address is freed, and forgets the network.
+
+Losing the connection by accident is different from going offline. When this
+PC can't reach Steam any more (ISteamUser::BLoggedOn), or finds itself no
+longer in the network's lobby, it doesn't know anything about the other
+members, so it doesn't conclude anything: the member list stays as it was last
+seen, behind a "Restoring connection..." overlay, and the adapter stays up.
+
+    online --(connection lost)--> RECONNECTING --(Steam back)--> RESTORING_NETWORK
+    RESTORING_NETWORK --(in the lobby again)--> online
+    RESTORING_NETWORK --(Steam lost again)--> RECONNECTING
+
+RECONNECTING lasts as long as Steam is unreachable. RESTORING_NETWORK gets
+back into the lobby, trying again with a growing delay, and gives up after
+RESTORE_TIMEOUT, or at once when Steam says the lobby no longer exists. Only a
+user's Go Offline stops all of this.
 """
 
 import enum
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from steamlan.adapter.ipv4 import VIRTUAL_NETWORK
 from steamlan.adapter.launcher import AdapterHelper, State
@@ -43,12 +58,17 @@ MAX_MEMBERS = 8
 CALL_TIMEOUT = 15.0
 # How long Leave Network keeps trying to tell the network before giving up.
 FAREWELL_TIMEOUT = 15.0
+# Once Steam is back, how long to keep trying to get back into the lobby.
+RESTORE_TIMEOUT = 90.0
+# Seconds before each further attempt to get back into the lobby.
+RESTORE_BACKOFF = (2.0, 4.0, 8.0, 15.0)
 
 _STEAM_ERRORS = (SteamAPILoadError, SteamInitError, SteamError)
 
 NETWORK_GONE = (
-    "That network no longer exists. Steam removes a network once all of its members are offline."
+    "Network is no longer available. Steam removes a network once all of its members are offline."
 )
+RESTORE_FAILED = "Could not restore the connection to the network. Go Online to try again."
 
 
 class Screen(enum.Enum):
@@ -62,9 +82,17 @@ class Presence(enum.Enum):
     Online and Offline, unrelated to the Steam friends status."""
 
     NONE = "none"  # not in a network
-    OFFLINE = "offline"
+    OFFLINE = "offline"  # chosen by the user, or given up on
     CONNECTING = "connecting"
     ONLINE = "online"
+    RESTORING = "restoring"  # the connection was lost by accident
+
+
+class Link(enum.Enum):
+    """Why a member that wants to be online isn't, while it recovers."""
+
+    RECONNECTING = "reconnecting"  # this PC can't reach Steam
+    RESTORING_NETWORK = "restoring"  # Steam is back; getting back into the lobby
 
 
 @dataclass(frozen=True)
@@ -87,6 +115,10 @@ class View:
     adapter_status: str = ""
     adapter_tone: str = "neutral"
     members: tuple[MemberView, ...] = ()
+    # While restoring: shown over the network page, whose members are then
+    # only as last seen.
+    overlay: str = ""
+    overlay_detail: str = ""
 
     @property
     def tray_status(self) -> str:
@@ -98,6 +130,8 @@ class View:
             return f"Online · {address}" if address else "Online"
         if self.presence is Presence.CONNECTING:
             return "Connecting..."
+        if self.presence is Presence.RESTORING:
+            return "Restoring connection..."
         if self.presence is Presence.OFFLINE:
             return "Offline"
         return "Not in a network"
@@ -168,6 +202,13 @@ class AppController:
         # JoinLobby calls given up on (Go Offline while connecting): if Steam
         # still lets us in, leave again. api_call -> lobby ID.
         self._abandoned: dict[int, int] = {}
+        # Set while recovering from an accidental loss of the connection.
+        self.link: Link | None = None
+        # The member list as last seen, shown while recovering.
+        self._frozen: tuple[MemberView, ...] = ()
+        self._restore_started = 0.0
+        self._next_attempt = 0.0
+        self._attempts = 0
 
     # Starting and stopping
 
@@ -196,6 +237,7 @@ class AppController:
         self._close_network()
         self._pending = None
         self.busy = ""
+        self._stop_recovering()
         if self.steam is not None:
             self.steam.close()
             self.steam = None
@@ -208,13 +250,21 @@ class AppController:
         self.saved = saved
         self.screen = Screen.NETWORK
         if saved.online:
-            self._start_join(saved.lobby_id, saved.access_code, "rejoin")
+            self._go_back_online()
+
+    def _go_back_online(self) -> None:
+        if self._logged_on():
+            self._start_join(self.saved.lobby_id, self.saved.access_code, "rejoin")
+        else:
+            self._lose_connection(logged_on=False)
 
     # What the UI shows
 
     def presence(self) -> Presence:
         if self._farewell_until is not None:
             return Presence.NONE
+        if self.link is not None:
+            return Presence.RESTORING
         if self.network is not None:
             return Presence.ONLINE if self.network.joined else Presence.CONNECTING
         if self._pending is not None and self._pending.kind == "rejoin":
@@ -242,6 +292,27 @@ class AppController:
             return View(self.screen, busy=self.busy, **base)
 
         network, saved = self.network, self.saved
+        adapter_status, adapter_tone = self._adapter_status(network)
+        if presence is Presence.RESTORING:
+            detail = (
+                "SteamVirtualLAN is reconnecting"
+                if self.link is Link.RECONNECTING
+                else "Rejoining your network..."
+            )
+            return View(
+                Screen.NETWORK,
+                presence=presence,
+                lobby_id=saved.lobby_id,
+                access_code=access.format_access_code(saved.access_code),
+                network_status="Restoring connection...",
+                network_tone="pending",
+                adapter_status=adapter_status,
+                adapter_tone=adapter_tone,
+                members=self._frozen,
+                overlay="Restoring connection...",
+                overlay_detail=detail,
+                **base,
+            )
         if network is not None:
             status, tone = network.status()
             members = tuple(network.members())
@@ -255,7 +326,6 @@ class AppController:
                 status, tone = "Connecting to the network...", "pending"
             else:
                 status, tone = "Offline", "neutral"
-        adapter_status, adapter_tone = self._adapter_status(network)
         in_roster = [member for member in members if member.address]
         online = sum(member.online for member in in_roster)
         if presence is not Presence.ONLINE:
@@ -275,7 +345,7 @@ class AppController:
             **base,
         )
 
-    def _offline_members(self) -> tuple[MemberView, ...]:
+    def _offline_members(self, status: str = "Offline") -> tuple[MemberView, ...]:
         saved = self.saved
         names = dict(saved.names)
         views = []
@@ -293,7 +363,7 @@ class AppController:
                     name or f"Steam user {str(steam_id)[-4:]}",
                     is_you=is_you,
                     online=False,
-                    status="Offline",
+                    status=status,
                     tone="neutral",
                     address=str(address),
                 )
@@ -365,18 +435,20 @@ class AppController:
             return
         self.error = ""
         self._save(saved.with_online(True))
-        self._start_join(saved.lobby_id, saved.access_code, "rejoin")
+        self._go_back_online()
 
     def go_offline(self) -> None:
-        """Stop being available in the network, but stay a member of it."""
+        """Stop being available in the network, but stay a member of it.
+        Nothing reconnects by itself until Go Online."""
         presence = self.presence()
-        if presence not in (Presence.ONLINE, Presence.CONNECTING):
+        if presence not in (Presence.ONLINE, Presence.CONNECTING, Presence.RESTORING):
             return
         if self.network is not None and self.network.joined:
             self._save(self._snapshot(online=False))
         elif self.saved is not None:
             self._save(self.saved.with_online(False))
         self._abandon()
+        self._stop_recovering()
         self.busy = ""
         self.error = ""
         self._close_network()
@@ -393,7 +465,14 @@ class AppController:
         self._leaving = saved
         self.screen = Screen.HOME
         self.error = ""
-        if network is not None and (network.joined or saved is not None):
+        if self.link is not None:
+            # There is no way to tell the network without a connection.
+            log.warning("Left while disconnected; the address stays taken in the network")
+            self._abandon()
+            self._stop_recovering()
+            self._close_network()
+            self._leaving = None
+        elif network is not None and (network.joined or saved is not None):
             self._begin_farewell()
         elif network is not None:
             # Was still joining a new network: nobody there knows this member.
@@ -473,16 +552,116 @@ class AppController:
                 self.busy = ""
                 self._call_failed(pending, "Steam did not answer in time")
 
+        if self._farewell_until is not None:
+            if self.network is not None:
+                self.network.process(callbacks)
+                self._farewell()
+            return
+        if self.saved is not None and (self.network is not None or self.link is not None):
+            self._watch_connection()
+
         network = self.network
         if network is not None:
             network.process(callbacks)
-            if self._farewell_until is not None:
-                self._farewell()
-                return
             self._forward_packets()
-            self._check_network()
-        elif self._pending is None:
+            if self.link is None:
+                self._check_network()
+            elif self.helper is not None and self.helper.state is State.FAILED:
+                self._go_offline_with(self.helper.error)
+        elif self._pending is None and self.link is None:
             self._handle_invites(callbacks)
+
+    # Recovering from a lost connection
+
+    def _logged_on(self) -> bool:
+        try:
+            return self.steam.logged_on
+        except SteamError:
+            return False
+
+    def _in_lobby(self, lobby_id: int) -> bool:
+        """Whether Steam still has this PC in the lobby."""
+        try:
+            return self.steam_id in self.steam.lobby_members(lobby_id) and bool(
+                self.steam.lobby_owner(lobby_id)
+            )
+        except SteamError:
+            return False
+
+    def _watch_connection(self) -> None:
+        logged_on = self._logged_on()
+        if self.link is None:
+            network = self.network
+            if network is not None and not (logged_on and self._in_lobby(network.lobby_id)):
+                self._lose_connection(logged_on)
+            return
+        if not logged_on:
+            if self.link is Link.RESTORING_NETWORK:
+                log.info("Lost the connection to Steam again")
+                self._abandon(leave=False)
+                self.link = Link.RECONNECTING
+                if self.network is not None:
+                    self.network.suspend()
+            return
+
+        now = self.clock()
+        if self.link is Link.RECONNECTING:
+            log.info("Steam is back; restoring the network")
+            self._begin_restoring(now)
+        if self._pending is not None:
+            return
+        network = self.network
+        if network is not None and self._in_lobby(network.lobby_id):
+            self._restored()
+        elif now - self._restore_started > RESTORE_TIMEOUT:
+            self._give_up(RESTORE_FAILED)
+        elif now >= self._next_attempt:
+            delay = RESTORE_BACKOFF[min(self._attempts, len(RESTORE_BACKOFF) - 1)]
+            self._attempts += 1
+            self._next_attempt = now + delay
+            self._start_join(self.saved.lobby_id, self.saved.access_code, "restore")
+
+    def _lose_connection(self, logged_on: bool) -> None:
+        """The connection was lost by accident: keep everything, and recover."""
+        network = self.network
+        if self.link is None:
+            if network is not None:
+                log.info("Lost the connection to the network")
+                members = network.members()
+            else:
+                members = self._offline_members(status="\u2014")
+            # As last seen: nothing about them is known now.
+            self._frozen = tuple(replace(member, latency="") for member in members)
+        if network is not None:
+            network.suspend()
+        if logged_on:
+            self._begin_restoring(self.clock())
+        else:
+            self.link = Link.RECONNECTING
+
+    def _begin_restoring(self, now: float) -> None:
+        self.link = Link.RESTORING_NETWORK
+        self._restore_started = now
+        self._next_attempt = now
+        self._attempts = 0
+
+    def _restored(self) -> None:
+        log.info("Back in the network")
+        self.network.resume()
+        self._stop_recovering()
+        self.error = ""
+
+    def _stop_recovering(self) -> None:
+        self.link = None
+        self._frozen = ()
+
+    def _give_up(self, reason: str) -> None:
+        """Stop trying; the membership is kept, and the next start tries again."""
+        log.warning("Could not restore the network: %s", reason)
+        self._abandon()
+        self._stop_recovering()
+        self._close_network()
+        self.error = reason
 
     def _check_network(self) -> None:
         network = self.network
@@ -523,6 +702,8 @@ class AppController:
             self._save(self._snapshot(online=False))
         else:
             self._save(self.saved.with_online(False))
+        self._abandon()
+        self._stop_recovering()
         self._close_network()
         self.error = reason
 
@@ -593,16 +774,27 @@ class AppController:
             self._call_failed(_Pending(kind, 0, 0.0, lobby_id, code), "Could not join lobby")
             return
         self._pending = _Pending(kind, api_call, self.clock(), lobby_id, code)
-        self.busy = {"join": "Joining...", "rejoin": "", "farewell": "Leaving the network..."}[kind]
+        self.busy = "Joining..." if kind == "join" else ""
+        if kind == "farewell":
+            self.busy = "Leaving the network..."
 
     def _call_failed(self, pending: _Pending, message: str) -> None:
+        if pending.kind == "restore":
+            # Tried again later, until RESTORE_TIMEOUT.
+            log.info("Could not get back into the network yet: %s", message)
+            if "not allowed" in message:
+                self._give_up(f"Could not go online: {message}")
+            return
         self._close_network()
         if pending.kind == "farewell":
             self._end_farewell()
             log.info("Could not tell the network about leaving: %s", message)
-        elif pending.kind == "rejoin":
+        elif pending.kind == "rejoin" and "not allowed" in message:
             self._save(self.saved.with_online(False))
             self.error = f"Could not go online: {message}"
+        elif pending.kind == "rejoin":
+            # Probably the connection; keep trying.
+            self._lose_connection(self._logged_on())
         else:
             self.error = message
 
@@ -634,7 +826,7 @@ class AppController:
             lobby_id = read_lobby_enter(result, pending.lobby_id)
         except SteamError as exc:
             log.warning("%s", exc)
-            if pending.kind == "rejoin" and "DOESNT_EXIST" in str(exc):
+            if pending.kind in ("rejoin", "restore") and "DOESNT_EXIST" in str(exc):
                 self._forget_gone_network()
             else:
                 self._call_failed(pending, join_error_message(exc))
@@ -645,14 +837,14 @@ class AppController:
             lobby_id, access.LOBBY_MARKER_KEY
         ) == access.LOBBY_MARKER_VALUE and access.is_network_id(network_id)
         saved = self._leaving if pending.kind == "farewell" else self.saved
-        if pending.kind in ("rejoin", "farewell") and (
+        if pending.kind in ("rejoin", "restore", "farewell") and (
             not ours or saved is None or network_id != saved.network_id
         ):
             self._close_network()
-            if pending.kind == "rejoin":
-                self._forget_gone_network()
-            else:
+            if pending.kind == "farewell":
                 self._end_farewell()
+            else:
+                self._forget_gone_network()
             return
         if not ours:
             self._close_network()
@@ -662,6 +854,12 @@ class AppController:
         if pending.kind == "join":
             self._enter(lobby_id, pending.access_code)
             return
+        if pending.kind == "restore" and self.network is not None:
+            # The same session carries on, with the same adapter.
+            self._restored()
+            return
+        if pending.kind == "restore":
+            self._stop_recovering()
         known = dict(saved.members)
         self._enter(
             lobby_id,
@@ -669,10 +867,12 @@ class AppController:
             known=known,
             names=dict(saved.names),
             preferred=known.get(self.steam_id),
-            adapter=pending.kind == "rejoin",
+            adapter=pending.kind != "farewell",
         )
 
     def _forget_gone_network(self) -> None:
+        self._abandon()
+        self._stop_recovering()
         self._close_network()
         log.info("The saved network %s no longer exists", self.saved.lobby_id)
         self._save(None)
@@ -704,6 +904,9 @@ class AppController:
         self.screen = Screen.NETWORK
         if not adapter:
             return
+        if self.helper is not None:
+            # Still up from before; never a second adapter or helper.
+            return
         # The adapter comes up while Steam connects the members; the UAC
         # prompt, if any, appears now.
         self.helper = self._make_helper()
@@ -731,9 +934,12 @@ class AppController:
         if self.network is not None:
             self._farewell()
 
-    def _abandon(self) -> None:
+    def _abandon(self, leave: bool = True) -> None:
+        """Forget the pending Steam call. With leave, a lobby it still gets
+        this PC into is left again; without, being in it is welcome (restoring
+        notices it)."""
         pending, self._pending = self._pending, None
-        if pending is not None and pending.kind != "create":
+        if pending is not None and pending.kind != "create" and pending.api_call and leave:
             self._abandoned[pending.api_call] = pending.lobby_id
 
     def _farewell(self) -> None:

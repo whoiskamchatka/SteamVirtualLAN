@@ -48,6 +48,15 @@ QLabel#badge {{
 }}
 
 QFrame#card {{ background: {SURFACE}; border-radius: 12px; }}
+QFrame#overlay {{ background: rgba(17, 19, 22, 0.55); }}
+QFrame#overlayCard {{
+    background: {RAISED}; border-radius: 12px; min-width: 280px;
+}}
+QLabel#latency {{
+    color: {MUTED}; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+}}
+QProgressBar#busy {{ background: {SURFACE}; border: none; border-radius: 2px; }}
+QProgressBar#busy::chunk {{ background: {ACCENT}; border-radius: 2px; }}
 QFrame#divider {{ background: {LINE}; max-height: 1px; min-height: 1px; }}
 QFrame#memberRow {{ background: transparent; border-radius: 8px; }}
 QFrame#memberRow:hover {{ background: {RAISED}; }}

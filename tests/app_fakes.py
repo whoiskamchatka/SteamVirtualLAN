@@ -44,6 +44,50 @@ def ipv4_packet(source, destination, payload=b"ping", protocol=1):
     return bytes(header) + payload
 
 
+def _checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(int.from_bytes(data[i : i + 2], "big") for i in range(0, len(data), 2))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def udp_packet(source, destination, source_port, destination_port, data=b"discover", ttl=1):
+    """A complete IPv4/UDP datagram with valid checksums, as Windows would send
+    it for a game's LAN discovery."""
+    source, destination = IPv4Address(source), IPv4Address(destination)
+    length = 8 + len(data)
+    udp = bytearray(
+        source_port.to_bytes(2, "big")
+        + destination_port.to_bytes(2, "big")
+        + length.to_bytes(2, "big")
+        + b"\0\0"
+        + data
+    )
+    pseudo = source.packed + destination.packed + b"\0\x11" + length.to_bytes(2, "big")
+    udp[6:8] = (_checksum(pseudo + bytes(udp)) or 0xFFFF).to_bytes(2, "big")
+    header = bytearray(20)
+    header[0] = 0x45
+    header[2:4] = (20 + length).to_bytes(2, "big")
+    header[4:6] = b"\x4a\x21"  # identification
+    header[8] = ttl
+    header[9] = 17
+    header[12:16] = source.packed
+    header[16:20] = destination.packed
+    header[10:12] = _checksum(bytes(header)).to_bytes(2, "big")
+    return bytes(header) + bytes(udp)
+
+
+def udp_ports(packet):
+    """(source port, destination port, data) of an IPv4/UDP packet with a 20-byte header."""
+    return (
+        int.from_bytes(packet[20:22], "big"),
+        int.from_bytes(packet[22:24], "big"),
+        packet[28:],
+    )
+
+
 def status(connection, state, remote, listen_socket=0):
     changed = SteamNetConnectionStatusChangedCallback()
     changed.m_hConn = connection
@@ -107,6 +151,7 @@ class FakeSteam:
         self.running = True
         self.overlay_enabled = True
         self.needs_present = False
+        self.logged_on = True
 
     def _record(self, name, *args):
         if name in self.fail:
@@ -191,6 +236,11 @@ class FakeSteam:
 
     def called(self, name):
         return [call[1:] for call in self.calls if call[0] == name]
+
+    @property
+    def packets(self):
+        """The IP packets sent, without the PINGs and PONGs that share their channel."""
+        return [(c, data) for c, data in self.unreliable if data[:1] == b"\x00"]
 
 
 class FakeHelper:

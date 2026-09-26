@@ -216,6 +216,19 @@ class SteamClient:
         return steam_id
 
     @property
+    def logged_on(self) -> bool:
+        """Whether the Steam client has a live connection to the Steam servers.
+
+        False while this PC's internet connection or Steam's servers are down;
+        Steam keeps trying to reconnect by itself (ISteamUser::BLoggedOn).
+        """
+        lib = self._running_lib()
+        user = steam_user(lib)
+        if not user:
+            raise SteamError("could not get the ISteamUser interface")
+        return lib.SteamAPI_ISteamUser_BLoggedOn(user)
+
+    @property
     def persona_name(self) -> str:
         lib = self._running_lib()
         name = lib.SteamAPI_ISteamFriends_GetPersonaName(self._friends(lib))

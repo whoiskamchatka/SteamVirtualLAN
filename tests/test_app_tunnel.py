@@ -5,6 +5,7 @@ from ipaddress import IPv4Address
 import pytest
 from app_fakes import ipv4_packet
 
+from steamlan.adapter.ipv4 import Delivery, addressing
 from steamlan.app import access, roster, tunnel
 
 HOST, B, C, D = 1, 2, 3, 4
@@ -95,17 +96,58 @@ def test_packet_messages_are_told_apart_by_their_first_byte():
     assert access.parse_message(tunnel.packet_message(accepted)) is None
 
 
-def test_destination_member():
-    owners = {A2: B, A3: C}
+@pytest.mark.parametrize(
+    ("destination", "delivery"),
+    [
+        (A2, Delivery.UNICAST),
+        ("10.77.0.254", Delivery.UNICAST),
+        ("10.77.0.255", Delivery.BROADCAST),
+        ("255.255.255.255", Delivery.BROADCAST),
+        ("224.0.0.1", Delivery.MULTICAST),
+        ("239.255.255.250", Delivery.MULTICAST),
+        ("239.255.255.255", Delivery.MULTICAST),
+        ("10.77.0.0", None),
+        ("10.77.1.1", None),
+        ("192.168.1.255", None),
+        ("223.255.255.255", None),
+        ("240.0.0.1", None),
+        ("0.0.0.0", None),
+    ],
+)
+def test_packets_are_classified_by_destination(destination, delivery):
+    info = addressing(ipv4_packet(A1, destination, protocol=17))
 
-    assert tunnel.destination_member(ipv4_packet(A1, A2), A1, owners) == B
-    assert tunnel.destination_member(ipv4_packet(A1, A3), A1, owners) == C
-    assert tunnel.destination_member(ipv4_packet(A1, A2), None, owners) is None
-    assert tunnel.destination_member(ipv4_packet(A2, A3), A1, owners) is None
+    assert (info.source, info.destination, info.protocol) == (A1, IPv4Address(destination), 17)
+    assert info.delivery is delivery
+
+
+def test_only_ipv4_is_classified():
+    assert addressing(b"\x60" + bytes(39)) is None
+    assert addressing(ipv4_packet(A1, A2)[:19]) is None
+    assert addressing(b"") is None
+
+
+def test_outgoing():
+    assert tunnel.outgoing(ipv4_packet(A1, A2), A1).delivery is Delivery.UNICAST
+    assert tunnel.outgoing(ipv4_packet(A1, "10.77.0.255"), A1).delivery is Delivery.BROADCAST
+    assert tunnel.outgoing(ipv4_packet(A1, "255.255.255.255"), A1).delivery is Delivery.BROADCAST
+    assert tunnel.outgoing(ipv4_packet(A1, "239.1.2.3"), A1).delivery is Delivery.MULTICAST
+    assert tunnel.outgoing(ipv4_packet(A1, A2), None) is None
+    assert tunnel.outgoing(ipv4_packet(A2, A3), A1) is None
+    assert tunnel.outgoing(ipv4_packet(A2, "10.77.0.255"), A1) is None
+    assert tunnel.outgoing(ipv4_packet(A1, A1), A1) is None
+    assert tunnel.outgoing(ipv4_packet(A1, "224.0.0.22", protocol=2), A1) is None
+    assert tunnel.outgoing(ipv4_packet(A1, "8.8.8.8"), A1) is None
 
 
 def test_accepts_packet():
-    assert tunnel.accepts_packet(ipv4_packet(A1, A2), A1, A2)
+    assert tunnel.accepts_packet(ipv4_packet(A1, A2), A1, A2) is Delivery.UNICAST
+    assert tunnel.accepts_packet(ipv4_packet(A1, "10.77.0.255"), A1, A2) is Delivery.BROADCAST
+    assert tunnel.accepts_packet(ipv4_packet(A1, "255.255.255.255"), A1, A2) is Delivery.BROADCAST
+    assert tunnel.accepts_packet(ipv4_packet(A1, "239.1.2.3"), A1, A2) is Delivery.MULTICAST
+    assert not tunnel.accepts_packet(ipv4_packet(A3, "10.77.0.255"), A1, A2)
+    assert not tunnel.accepts_packet(ipv4_packet(A1, "10.77.0.255"), None, A2)
+    assert not tunnel.accepts_packet(ipv4_packet(A2, "239.1.2.3"), A2, A2)
     assert not tunnel.accepts_packet(ipv4_packet(A1, A2), None, A2)
     assert not tunnel.accepts_packet(ipv4_packet(A1, A2), A1, None)
     assert not tunnel.accepts_packet(ipv4_packet(A3, A2), A1, A2)

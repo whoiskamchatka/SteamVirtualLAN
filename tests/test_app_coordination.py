@@ -1,128 +1,16 @@
-"""Whole networks: several apps on the simulated Steam in steam_sim.py.
-
-Each app is an AppController with its own saved state and a FakeHelper in
-place of the adapter, so these run without Steam, UAC or Wintun.
-"""
-
-from ipaddress import IPv4Address
+"""Whole networks: several apps on the simulated Steam (network_harness.py)."""
 
 import pytest
-from app_fakes import GUEST, HOST, OTHER, FakeHelper, ipv4_packet
-from steam_sim import World
+from network_harness import A1, A2, A3, A4, A, B, C, D, Net, statuses, three_members
 
 from steamlan.adapter.launcher import State
-from steamlan.app import access, roster, tunnel
-from steamlan.app.controller import NETWORK_GONE, AppController, Presence, Screen
-from steamlan.app.state import StateStore
-
-A, B, C, D = HOST, GUEST, OTHER, OTHER + 1
-A1, A2, A3, A4 = (IPv4Address(f"10.77.0.{n}") for n in (1, 2, 3, 4))
-NAMES = {A: "Alice", B: "Bob", C: "Carol", D: "Dave"}
-
-
-class Clock:
-    def __init__(self):
-        self.now = 0.0
-
-    def __call__(self):
-        return self.now
-
-
-class Net:
-    """The simulated Steam and one PC per SteamID, each with its own saved state."""
-
-    def __init__(self, tmp_path, pick_owner=None):
-        self.world = World(pick_owner)
-        self.clock = Clock()
-        self.tmp_path = tmp_path
-        self.apps: dict[int, AppController] = {}
-        # Every message sent: (from, to, data).
-        self.wire = []
-
-    def start(self, steam_id) -> AppController:
-        """Start SteamVirtualLAN on steam_id's PC (again)."""
-        steam = self.world.client(steam_id, NAMES[steam_id])
-        send = steam.send_message
-
-        def recorded(handle, data, reliable=True):
-            connection = steam.connections.get(handle)
-            send(handle, data, reliable)
-            self.wire.append((steam_id, connection.remote, bytes(data)))
-
-        steam.send_message = recorded
-        store = StateStore(self.tmp_path / str(steam_id) / "state.json")
-        app = AppController(lambda: steam, self.clock, lambda: FakeHelper(steam), store)
-        app.start()
-        self.apps[steam_id] = app
-        return app
-
-    def stop(self, steam_id):
-        """Exit, as from the tray menu."""
-        self.apps.pop(steam_id).shutdown()
-
-    def crash(self, steam_id):
-        """The PC loses power: nothing is cleaned up or saved."""
-        app = self.apps.pop(steam_id)
-        app.steam.crash()
-
-    def run(self, ticks=8):
-        for _ in range(ticks):
-            for app in list(self.apps.values()):
-                app.tick()
-                if app.helper is not None and app.helper.state is State.STARTING:
-                    app.helper.become_ready()
-            self.clock.now += 0.05
-
-    def create(self, steam_id) -> AppController:
-        app = self.start(steam_id)
-        app.create_lobby()
-        self.run()
-        assert app.presence() is Presence.ONLINE
-        return app
-
-    def join(self, steam_id, creator: AppController) -> AppController:
-        app = self.start(steam_id)
-        view = creator.view()
-        app.show_join()
-        app.join(str(view.lobby_id), view.access_code)
-        self.run()
-        return app
-
-    def owner(self):
-        (lobby,) = self.world.lobbies.values()
-        return lobby.owner
-
-    def roster(self):
-        (lobby,) = self.world.lobbies.values()
-        return roster.decode(lobby.data[roster.ROSTER_KEY])
-
-    def ping(self, source, destination) -> bool:
-        """Windows on source sends a packet to destination's address."""
-        sender, receiver = self.apps[source], self.apps[destination]
-        packet = ipv4_packet(sender.network.local_address, receiver.network.local_address)
-        sender.helper.from_windows.append(packet)
-        self.run(2)
-        return packet in receiver.helper.to_windows
-
-    def packets_between(self):
-        return {(a, b) for a, b, data in self.wire if tunnel.packet_payload(data) is not None}
-
-
-def statuses(app):
-    return {member.steam_id: (member.status, member.address) for member in app.view().members}
+from steamlan.app import access
+from steamlan.app.controller import NETWORK_GONE, Presence, Screen
 
 
 @pytest.fixture
 def net(tmp_path):
     return Net(tmp_path)
-
-
-def three_members(net):
-    alice = net.create(A)
-    net.join(B, alice)
-    net.join(C, alice)
-    net.run()
-    return alice
 
 
 def test_members_are_admitted_with_addresses_in_order(net):
@@ -228,7 +116,7 @@ def test_coordinator_that_disappears_is_replaced(net):
 
     assert net.owner() == survivor
     assert net.apps[survivor].network.is_coordinator
-    assert statuses(net.apps[survivor])[coordinator][0] == "Offline"
+    assert statuses(net.apps[survivor])[coordinator][0] == "Lost connection"
     assert net.roster()[coordinator] == {B: A2, C: A3}[coordinator]
 
 

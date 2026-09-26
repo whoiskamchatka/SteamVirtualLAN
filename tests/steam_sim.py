@@ -95,6 +95,9 @@ class SimSteam:
         self.lobbies: set[int] = set()
         self.calls = []
         self.overlay_enabled = True
+        self.logged_on = True
+        # Steam answers every JoinLobby with k_EChatRoomEnterResponseError.
+        self.fail_joins = False
 
     # Callbacks
 
@@ -117,8 +120,12 @@ class SimSteam:
         return api_call
 
     def request_join_lobby(self, lobby_id):
+        self.calls.append(("request_join_lobby", lobby_id))
         api_call = self.world.call()
         lobby = self.world.lobbies.get(lobby_id)
+        if not self.logged_on or self.fail_joins:
+            self.queue.append(lobby_entered(ChatRoomEnterResponse.ERROR, lobby_id, api_call))
+            return api_call
         if lobby is None:
             self.queue.append(lobby_entered(ChatRoomEnterResponse.DOESNT_EXIST, lobby_id, api_call))
             return api_call
@@ -158,7 +165,7 @@ class SimSteam:
 
     def set_lobby_data(self, lobby_id, key, value):
         lobby = self._lobby(lobby_id)
-        if lobby.owner != self.steam_id:
+        if lobby.owner != self.steam_id or not self.logged_on:
             raise SteamError(f"SetLobbyData failed for {key!r}")
         lobby.data[key] = value
 
@@ -195,7 +202,8 @@ class SimSteam:
         connection = Connection(self.steam_id, remote_steam_id, handle)
         self.connections[handle] = connection
         remote = self.world.clients.get(remote_steam_id)
-        if remote is None or not remote.running or not remote.listen_sockets:
+        reachable = remote is not None and remote.running and remote.listen_sockets
+        if not reachable or not self.logged_on or not remote.logged_on:
             connection.open = False
             self.queue.append(
                 status(handle, ConnectionState.PROBLEM_DETECTED_LOCALLY, remote_steam_id)
@@ -246,12 +254,17 @@ class SimSteam:
 
     # Going away
 
-    def crash(self):
-        """The process dies: Steam notices the member is gone, and its
-        connections drop."""
-        self.running = False
-        for handle in list(self.connections):
-            connection = self.connections.pop(handle)
+    def _drop_connections(self, notify_self: bool) -> None:
+        for handle, connection in list(self.connections.items()):
+            if not connection.open:
+                continue
+            connection.open = connection.connected = False
+            if notify_self:
+                self.queue.append(
+                    status(handle, ConnectionState.PROBLEM_DETECTED_LOCALLY, connection.remote)
+                )
+            else:
+                del self.connections[handle]
             other = self.world.clients.get(connection.remote)
             remote = other.connections.get(connection.remote_handle) if other else None
             if remote is not None and remote.open:
@@ -259,6 +272,29 @@ class SimSteam:
                 other.queue.append(
                     status(remote.handle, ConnectionState.PROBLEM_DETECTED_LOCALLY, self.steam_id)
                 )
+
+    def lose_connection(self, drop_from_lobby=True, drop_connections=True):
+        """This PC's internet goes away. Steam drops the member from its
+        lobbies (unless it is back before Steam notices), and connections to
+        it time out."""
+        self.logged_on = False
+        if drop_connections:
+            self._drop_connections(notify_self=True)
+        if drop_from_lobby:
+            for lobby_id in list(self.lobbies):
+                self.world.remove_member(
+                    lobby_id, self.steam_id, ChatMemberStateChange.DISCONNECTED
+                )
+            self.lobbies.clear()
+
+    def restore_connection(self):
+        self.logged_on = True
+
+    def crash(self):
+        """The process dies: Steam notices the member is gone, and its
+        connections drop."""
+        self.running = False
+        self._drop_connections(notify_self=False)
         for lobby_id in list(self.lobbies):
             self.world.remove_member(lobby_id, self.steam_id, ChatMemberStateChange.DISCONNECTED)
         self.lobbies.clear()

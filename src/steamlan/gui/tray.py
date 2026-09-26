@@ -16,6 +16,7 @@ from steamlan.gui.style import ACCENT, TONES
 _PRESENCE_TONES = {
     Presence.ONLINE: "ok",
     Presence.CONNECTING: "pending",
+    Presence.RESTORING: "pending",
     Presence.OFFLINE: "neutral",
     Presence.NONE: "neutral",
 }

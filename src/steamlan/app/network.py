@@ -35,8 +35,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from ipaddress import IPv4Address
 
+from steamlan.adapter.ipv4 import Delivery
 from steamlan.app import access, roster, tunnel
-from steamlan.steam import LobbySession, SteamCallback, SteamClient, SteamError
+from steamlan.app.latency import LatencyTracker, format_rtt
+from steamlan.steam import (
+    ChatMemberStateChange,
+    LobbyMemberUpdate,
+    LobbySession,
+    SteamCallback,
+    SteamClient,
+    SteamError,
+    decode_lobby_event,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +57,8 @@ AUTH_TIMEOUT = 20.0
 MAX_FAILURES = 5
 # How long an owner that isn't a member waits before handing ownership again.
 HAND_OFF_INTERVAL = 5.0
+# How often the traffic counters are logged (at debug level), if they changed.
+TRAFFIC_LOG_INTERVAL = 60.0
 
 NO_MEMBERS_ONLINE = "Nobody from this network is online right now"
 
@@ -60,6 +72,8 @@ class MemberView:
     status: str
     tone: str  # "ok", "pending", "error" or "neutral"
     address: str = ""  # virtual IP address, once the member has one
+    # Round-trip time to a connected member, e.g. "24 ms"; "" otherwise.
+    latency: str = ""
 
 
 def display_id(steam_id: int) -> str:
@@ -109,10 +123,19 @@ class NetworkSession:
         self.refused = ""
         # Members that announced they leave the network for good.
         self.left: set[int] = set()
+        # Members that dropped out of the lobby without leaving it (their
+        # connection to Steam was lost), rather than going offline.
+        self.lost: set[int] = set()
+        # While suspended (this PC lost its connection to Steam) only the
+        # connections are looked after; nothing is concluded about the others.
+        self.suspended = False
+        self.latency = LatencyTracker(clock)
         self.lobby = LobbySession(steam, lobby_id, listen_socket, log=log.info, clock=clock)
         # Checked IP packets from other members, waiting for the local adapter.
         self._packets: list[bytes] = []
-        self.dropped_packets = 0
+        self.traffic = tunnel.TrafficStats()
+        self._traffic_logged_at = clock()
+        self._traffic_logged = ""
         self._waiting_since: dict[int, float] = {}
         self._failures: Counter[int] = Counter()
         self._auth_sent_to = 0
@@ -136,6 +159,8 @@ class NetworkSession:
         return self.roster.get(self.local_id)
 
     def process(self, callbacks: list[SteamCallback]) -> None:
+        if not self.suspended:
+            self._note_departures(callbacks)
         for steam_id, data in self.lobby.process(callbacks):
             packet = tunnel.packet_payload(data)
             if packet is not None:
@@ -144,6 +169,8 @@ class NetworkSession:
             message = access.parse_message(data)
             if message is not None:
                 self._message(steam_id, message)
+        if self.suspended:
+            return
 
         self._sync()
         if self.is_coordinator:
@@ -152,9 +179,34 @@ class NetworkSession:
             self._hand_off()
         else:
             self._member_checks()
+        self._ping()
+        self._log_traffic()
 
     def close(self, linger: bool = False) -> None:
         self.lobby.close(linger)
+
+    def suspend(self) -> None:
+        """This PC lost its connection to Steam. Keep the roster and whatever
+        connections survive, but draw no conclusions about the other members
+        and start no connections until resume()."""
+        if self.suspended:
+            return
+        log.info("Connection to Steam lost; the network is on hold")
+        self.suspended = True
+        self.lobby.pause()
+        self.latency.clear()
+
+    def resume(self) -> None:
+        """Back in the lobby after suspend(): follow it as it is now and
+        reconnect to every member whose connection dropped meanwhile."""
+        log.info("Connection to Steam restored")
+        self.suspended = False
+        self.lost.clear()
+        self.lobby.resume()
+        if not self.joined:
+            # Whatever went wrong while the connection was down doesn't count.
+            self.refused = ""
+            self._auth_sent_to = 0
 
     def announce_leave(self) -> bool:
         """Tell the network this member leaves it for good (Leave Network), so
@@ -173,28 +225,63 @@ class NetworkSession:
             return True
         return False
 
-    def send_packet(self, packet: bytes) -> bool:
-        """Send an IP packet from the local adapter directly to the member that
-        owns its destination address. False if it was dropped."""
-        owners = {
-            address: steam_id
-            for steam_id, address in self.roster.items()
-            if steam_id != self.local_id
-        }
-        steam_id = tunnel.destination_member(packet, self.local_address, owners)
-        if steam_id is None:
-            self.dropped_packets += 1
-            return False
-        try:
-            self.lobby.send(steam_id, tunnel.packet_message(packet), reliable=False)
-        except SteamError as exc:
-            log.debug("Dropped a packet for %s: %s", steam_id, exc)
-            self.dropped_packets += 1
-            return False
-        return True
+    @property
+    def dropped_packets(self) -> int:
+        return self.traffic.dropped_total
+
+    def send_packet(self, packet: bytes) -> int:
+        """Send an IP packet from the local adapter directly to the members it
+        is for (tunnel.py): the member that owns its destination address, or,
+        for broadcast and multicast, every member connected right now, once
+        each. Returns the number of members it went to; 0 if it was dropped."""
+        info = tunnel.outgoing(packet, self.local_address)
+        if info is None:
+            self.traffic.dropped("tx_unroutable")
+            return 0
+        if info.delivery is Delivery.UNICAST:
+            owner = next(
+                (
+                    steam_id
+                    for steam_id, address in self.roster.items()
+                    if address == info.destination and steam_id != self.local_id
+                ),
+                None,
+            )
+            if owner is None:
+                self.traffic.dropped("tx_unknown_destination")
+                return 0
+            recipients = [owner]
+        else:
+            # One copy for every member connected now: not this member, not
+            # members that are offline, still joining or reconnecting. Each
+            # member has one connection, so none gets two.
+            recipients = sorted(
+                steam_id
+                for steam_id in self.lobby.connected_peers()
+                if steam_id in self.roster and steam_id != self.local_id
+            )
+            if not recipients:
+                self.traffic.dropped("tx_no_recipients")
+                return 0
+        message = tunnel.packet_message(packet)
+        copies = 0
+        for steam_id in recipients:
+            try:
+                self.lobby.send(steam_id, message, reliable=False)
+            except SteamError:
+                self.traffic.dropped("tx_send_failed")
+            else:
+                copies += 1
+        if copies:
+            self.traffic.sent(info.delivery, copies)
+        return copies
 
     def take_packets(self) -> list[bytes]:
-        """IP packets other members sent to this member since the last call."""
+        """IP packets other members sent to this member since the last call.
+
+        They are for this member's Windows only; nothing here ever sends them
+        on to another member.
+        """
         packets, self._packets = self._packets, []
         return packets
 
@@ -226,12 +313,20 @@ class NetworkSession:
             if steam_id == self.local_id:
                 continue
             peer = self.lobby.peers.get(steam_id)
-            if peer is None:
+            latency = ""
+            if peer is None and steam_id in self.lost:
+                # Dropped out of the lobby without leaving it.
+                status, tone = "Lost connection", "neutral"
+            elif peer is None:
                 status, tone = "Offline", "neutral"
             elif peer.connected:
                 status, tone = "Online", "ok"
+                latency = format_rtt(self.latency.rtt(steam_id))
+            elif peer.was_connected:
+                # Still in the lobby, just unreachable for now.
+                status, tone = "Reconnecting...", "pending"
             else:
-                status, tone = "Connecting", "pending"
+                status, tone = "Connecting...", "pending"
             views.append(
                 MemberView(
                     steam_id,
@@ -241,6 +336,7 @@ class NetworkSession:
                     status=status,
                     tone=tone,
                     address=str(address),
+                    latency=latency,
                 )
             )
         joining = [
@@ -270,7 +366,14 @@ class NetworkSession:
         return "Online", "ok"
 
     def _message(self, steam_id: int, message: access.Message) -> None:
-        if message.kind == "leave":
+        if message.kind == "ping":
+            try:
+                self.lobby.send(steam_id, access.pong_message(message.sequence), reliable=False)
+            except SteamError:
+                pass
+        elif message.kind == "pong":
+            self.latency.pong(steam_id, message.sequence)
+        elif message.kind == "leave":
             if steam_id in self.roster:
                 log.info("%s left the network", steam_id)
                 self.left.add(steam_id)
@@ -300,12 +403,11 @@ class NetworkSession:
         if owner != previous:
             self.coordinator_id = owner
             log.info("The network is now coordinated by %s", owner or "nobody")
-        if owner == self.local_id and self.joined and previous in self._trusted:
-            # Just took over: first pick up what the previous coordinator last
-            # wrote, in case it arrived together with the change of owner.
-            self._take_roster(previous)
-            return
         if owner == self.local_id and self.joined:
+            if previous != owner and previous in self._trusted:
+                # Just took over: first pick up what the previous coordinator
+                # last wrote, in case it arrived together with the change.
+                self._take_roster(previous)
             return
         self._take_roster(owner)
         if (
@@ -431,6 +533,32 @@ class NetworkSession:
         elif self._auth_sent_to and self.clock() - self._auth_sent_at > AUTH_TIMEOUT:
             self.refused = "The network did not answer"
 
+    def _note_departures(self, callbacks: list[SteamCallback]) -> None:
+        for callback in callbacks:
+            event = decode_lobby_event(callback)
+            if not isinstance(event, LobbyMemberUpdate) or event.lobby_id != self.lobby_id:
+                continue
+            if event.state & ChatMemberStateChange.DISCONNECTED:
+                self.lost.add(event.user_id)
+            else:
+                self.lost.discard(event.user_id)
+
+    def _ping(self) -> None:
+        """Measure the round trip to every connected member (latency.py)."""
+        connected = {
+            peer.steam_id: peer.connection
+            for peer in self.lobby.peers.values()
+            if peer.connected and peer.steam_id in self.roster
+        }
+        self.latency.track(connected)
+        for steam_id, sequence in self.latency.due():
+            try:
+                # Unreliable, like the packets: a lost PING is just lost,
+                # instead of being resent and measuring the resend.
+                self.lobby.send(steam_id, access.ping_message(sequence), reliable=False)
+            except SteamError:
+                pass
+
     def _send_leave(self) -> None:
         for steam_id in self.lobby.connected_peers():
             try:
@@ -440,7 +568,19 @@ class NetworkSession:
 
     def _receive_packet(self, steam_id: int, packet: bytes) -> None:
         sender_address = self.roster.get(steam_id) if steam_id != self.local_id else None
-        if tunnel.accepts_packet(packet, sender_address, self.local_address):
-            self._packets.append(packet)
-        else:
-            self.dropped_packets += 1
+        delivery = tunnel.accepts_packet(packet, sender_address, self.local_address)
+        if delivery is None:
+            self.traffic.dropped("rx_rejected")
+            return
+        self._packets.append(packet)
+        self.traffic.received(delivery)
+
+    def _log_traffic(self) -> None:
+        now = self.clock()
+        if now - self._traffic_logged_at < TRAFFIC_LOG_INTERVAL:
+            return
+        self._traffic_logged_at = now
+        summary = self.traffic.summary()
+        if summary != self._traffic_logged:
+            self._traffic_logged = summary
+            log.debug("Tunnel traffic: %s", summary)

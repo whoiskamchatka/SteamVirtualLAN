@@ -246,17 +246,66 @@ def test_incoming_connection_from_peer_we_initiate_to_is_rejected():
     assert s.peers[HIGH].connection == 101
 
 
-def test_second_incoming_connection_is_rejected():
+def test_new_incoming_connection_replaces_the_old_one():
+    """The peer only connects again when its end of the old connection is
+    gone, e.g. after it lost Steam; this side may not have noticed yet."""
     steam = FakeSteam(members=[LOW, ME])
     s = session(steam)
-    steam.frames = [[incoming(7, LOW)], [incoming(8, LOW)]]
+    steam.frames = [
+        [incoming(7, LOW)],
+        [status(7, ConnectionState.CONNECTED, LOW, LISTEN_SOCKET)],
+        [incoming(8, LOW)],
+    ]
 
     s.poll()
     s.poll()
+    s.poll()
 
-    assert steam.accepted == [7]
-    assert steam.closed == [8]
-    assert s.peers[LOW].connection == 7
+    assert steam.accepted == [7, 8]
+    assert steam.closed == [7]
+    peer = s.peers[LOW]
+    assert (peer.connection, peer.connected, peer.was_connected) == (8, False, True)
+
+
+def test_paused_session_starts_no_connections_and_resumes_at_once():
+    clock = Clock()
+    steam = FakeSteam(members=[ME, HIGH, HIGHER])
+    s = session(steam, clock=clock)
+    s.poll()
+    steam.frames = [
+        [
+            status(101, ConnectionState.CONNECTED, HIGH),
+            status(102, ConnectionState.CONNECTED, HIGHER),
+        ],
+        [status(101, ConnectionState.PROBLEM_DETECTED_LOCALLY, HIGH)],
+    ]
+    s.poll()
+    s.pause()
+    s.poll()
+
+    clock.now = 1000
+    s.poll()
+    assert steam.connects == [(HIGH, 101), (HIGHER, 102)]
+
+    clock.now = 1000.5
+    s.resume()
+    s.poll()
+
+    # Only the dropped connection is made again, straight away; the live one stays.
+    assert steam.connects == [(HIGH, 101), (HIGHER, 102), (HIGH, 103)]
+    assert s.peers[HIGHER].connection == 102
+    assert s.peers[HIGH].was_connected
+
+
+def test_resume_follows_the_lobby_as_it_is_now():
+    steam = FakeSteam(members=[ME, HIGH])
+    s = session(steam)
+    s.pause()
+    steam.members = [ME, HIGHER]
+
+    s.resume()
+
+    assert list(s.peers) == [HIGHER]
 
 
 def test_incoming_on_other_listen_socket_is_not_accepted():

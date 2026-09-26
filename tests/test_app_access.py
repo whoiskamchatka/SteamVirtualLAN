@@ -101,6 +101,15 @@ def test_message_format():
         b"SVL2 OK 7K2QD",
         b"SVL2 OK 7K2QDM9XTU",
         b"SVL2 LEAVE now",
+        b"SVL2 PING",
+        b"SVL2 PING ",
+        b"SVL2 PING 0",
+        b"SVL2 PING -1",
+        b"SVL2 PING 4294967296",
+        b"SVL2 PING 12345678901",
+        b"SVL2 PONG 1 2",
+        b"SVL2 PONG x",
+        b"SVL2 PONG \xd9\xa3",
         b"SVL2 MEMBERS 5=10.77.0.2",
     ],
 )
@@ -140,3 +149,12 @@ def test_invite_connect_string_round_trip():
 def test_foreign_or_broken_connect_strings(text):
     with pytest.raises(ValueError):
         access.parse_invite_connect_string(text)
+
+
+def test_ping_and_pong_round_trip():
+    assert access.ping_message(7) == b"SVL2 PING 7"
+    assert access.pong_message(7) == b"SVL2 PONG 7"
+    assert access.parse_message(access.ping_message(1)) == access.Message("ping", sequence=1)
+    assert access.parse_message(access.pong_message(access.MAX_SEQUENCE)) == access.Message(
+        "pong", sequence=access.MAX_SEQUENCE
+    )

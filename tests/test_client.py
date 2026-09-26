@@ -1091,3 +1091,18 @@ def test_set_lobby_owner_invalid_id(steam, lib):
         steam.set_lobby_owner(LOBBY_ID, 0)
 
     lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.assert_not_called()
+
+
+@pytest.mark.parametrize("logged_on", [True, False])
+def test_logged_on(steam, lib, logged_on):
+    lib.SteamAPI_ISteamUser_BLoggedOn.return_value = logged_on
+
+    assert steam.logged_on is logged_on
+    lib.SteamAPI_ISteamUser_BLoggedOn.assert_called_with(USER)
+
+
+def test_logged_on_without_user_interface(steam, lib):
+    lib.SteamAPI_SteamUser_v023.return_value = None
+
+    with pytest.raises(SteamError, match="ISteamUser"):
+        _ = steam.logged_on

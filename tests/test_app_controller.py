@@ -27,7 +27,9 @@ from steamlan.app.controller import (
     CALL_TIMEOUT,
     FAREWELL_TIMEOUT,
     NETWORK_GONE,
+    RESTORE_FAILED,
     AppController,
+    Link,
     Presence,
     Screen,
 )
@@ -605,7 +607,7 @@ def test_packets_from_windows_go_to_the_member_that_owns_the_address():
 
     controller.tick()
 
-    assert steam.unreliable == [(connection, tunnel.packet_message(packet))]
+    assert steam.packets == [(connection, tunnel.packet_message(packet))]
 
 
 def test_packets_from_members_go_to_windows():
@@ -862,13 +864,12 @@ def test_saved_network_whose_lobby_is_now_something_else_is_forgotten(store):
     assert store.load(GUEST) is None
 
 
-@pytest.mark.parametrize("response", [ChatRoomEnterResponse.ERROR, ChatRoomEnterResponse.LIMITED])
-def test_rejoin_failure_keeps_the_membership_offline(store, response):
+def test_rejoin_that_is_not_allowed_goes_offline(store):
     store.save(GUEST, saved_network())
     steam = FakeSteam(GUEST)
     controller = started(steam, store=store)
 
-    steam.frames = [[lobby_entered(response)]]
+    steam.frames = [[lobby_entered(ChatRoomEnterResponse.LIMITED)]]
     controller.tick()
 
     view = controller.view()
@@ -877,7 +878,33 @@ def test_rejoin_failure_keeps_the_membership_offline(store, response):
     assert store.load(GUEST) == saved_network(online=False)
 
 
-def test_rejoin_timeout_keeps_the_membership_offline(store):
+def test_rejoin_that_fails_for_now_keeps_trying(store):
+    store.save(GUEST, saved_network())
+    clock = Clock()
+    steam = FakeSteam(GUEST, [HOST, GUEST])
+    controller = started(steam, clock, store)
+
+    steam.frames = [[lobby_entered(ChatRoomEnterResponse.ERROR)]]
+    controller.tick()
+
+    view = controller.view()
+    assert (view.screen, view.presence) == (Screen.NETWORK, Presence.RESTORING)
+    assert view.overlay == "Restoring connection..."
+    assert [(m.address, m.status) for m in view.members] == [
+        ("10.77.0.2", "\u2014"),
+        ("10.77.0.1", "\u2014"),
+    ]
+    assert store.load(GUEST).online
+    assert len(steam.called("request_join_lobby")) == 2
+
+    network_lobby(steam, {HOST: A1, GUEST: A2})
+    steam.frames = [[lobby_entered(api_call=JOIN_CALL)]]
+    controller.tick()
+    assert controller.presence() is Presence.ONLINE
+    assert len(controller.helpers) == 1
+
+
+def test_rejoin_timeout_keeps_trying_then_gives_up(store):
     store.save(GUEST, saved_network())
     clock = Clock()
     steam = FakeSteam(GUEST)
@@ -885,9 +912,61 @@ def test_rejoin_timeout_keeps_the_membership_offline(store):
 
     clock.now = CALL_TIMEOUT + 1
     controller.tick()
+    assert controller.presence() is Presence.RESTORING
+
+    for _ in range(40):
+        clock.now += 5
+        controller.tick()
 
     assert controller.presence() is Presence.OFFLINE
-    assert controller.error == "Could not go online: Steam did not answer in time"
+    assert controller.error == RESTORE_FAILED
+    assert store.load(GUEST).online
+
+
+def test_losing_steam_keeps_the_lobby_the_adapter_and_the_roster(store):
+    steam, controller, connection = creator_with_member()
+    helper = controller.helper
+    before = controller.view().members
+
+    steam.logged_on = False
+    steam.frames = [[status(connection, ConnectionState.PROBLEM_DETECTED_LOCALLY, GUEST)]]
+    controller.tick()
+    controller.tick()
+
+    view = controller.view()
+    assert view.presence is Presence.RESTORING
+    assert [(m.steam_id, m.address, m.status) for m in view.members] == [
+        (m.steam_id, m.address, m.status) for m in before
+    ]
+    assert steam.called("leave_lobby") == []
+    assert steam.called("close_listen_socket") == []
+    assert helper.state is helper.State.READY
+    assert controller.network.suspended
+    # No new connection is attempted while Steam is unreachable.
+    assert len(steam.called("connect_p2p")) == 1
+
+    steam.logged_on = True
+    controller.tick()
+
+    assert controller.presence() is Presence.ONLINE
+    assert not controller.network.suspended
+    assert steam.called("request_join_lobby") == []
+    assert len(steam.called("connect_p2p")) == 2
+    assert controller.helper is helper and len(controller.helpers) == 1
+
+
+def test_leaving_the_lobby_by_accident_is_a_lost_connection():
+    steam, controller = creator()
+    controller.tick()
+
+    steam.members = []
+    controller.tick()
+    assert controller.link is Link.RESTORING_NETWORK
+    assert controller.view().overlay_detail == "Rejoining your network..."
+    controller.tick()
+
+    assert steam.called("request_join_lobby") == [(LOBBY,)]
+    assert steam.called("leave_lobby") == []
 
 
 def test_network_that_no_longer_knows_this_member_is_forgotten(store):

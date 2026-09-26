@@ -407,3 +407,10 @@ def test_lobby_owner_signatures():
         ctypes.c_uint64,
     ]
     assert lib.SteamAPI_ISteamMatchmaking_SetLobbyOwner.restype is ctypes.c_bool
+
+
+def test_logged_on_signature():
+    lib = bind(mock.Mock())
+
+    assert lib.SteamAPI_ISteamUser_BLoggedOn.argtypes == [ctypes.c_void_p]
+    assert lib.SteamAPI_ISteamUser_BLoggedOn.restype is ctypes.c_bool

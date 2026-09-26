@@ -115,9 +115,32 @@ class Message:
     # "accepted": the coordinator admitted the member; carries the access code.
     # "denied": the coordinator refused the member.
     # "leave": the sender leaves the network for good (Leave Network).
+    # "ping", "pong": latency measurement (latency.py); PONG echoes the
+    #   PING's sequence number.
     kind: str
     code: str = ""
     address: IPv4Address | None = None
+    sequence: int = 0
+
+
+# Sequence numbers of PING and PONG are decimal and fit an unsigned 32 bits.
+MAX_SEQUENCE = 2**32 - 1
+
+
+def ping_message(sequence: int) -> bytes:
+    return PREFIX + b"PING " + str(sequence).encode()
+
+
+def pong_message(sequence: int) -> bytes:
+    return PREFIX + b"PONG " + str(sequence).encode()
+
+
+def _parse_sequence(data: bytes) -> int | None:
+    if 0 < len(data) <= 10 and data.isdigit() and data.isascii():
+        sequence = int(data)
+        if 0 < sequence <= MAX_SEQUENCE:
+            return sequence
+    return None
 
 
 def auth_message(code: str, preferred: IPv4Address | None = None) -> bytes:
@@ -143,6 +166,10 @@ def parse_message(data: bytes) -> Message | None:
         return Message("denied")
     if data == LEAVE:
         return Message("leave")
+    for kind, keyword in (("ping", b"PING "), ("pong", b"PONG ")):
+        if data.startswith(PREFIX + keyword):
+            sequence = _parse_sequence(data[len(PREFIX) + len(keyword) :])
+            return Message(kind, sequence=sequence) if sequence is not None else None
     if data.startswith(PREFIX + b"OK "):
         code = _parse_code(data[len(PREFIX) + 3 :])
         if code is not None and len(code) == CODE_LENGTH and set(code) <= set(ALPHABET):

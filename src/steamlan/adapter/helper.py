@@ -8,7 +8,8 @@ SteamVirtualLAN adapter and then does nothing but:
 - give the adapter the one address the app asks for, which must be in 10.77.0.0/24;
 - pass the IPv4 packets Windows sends into the adapter to the app;
 - write IPv4 packets from the app to the adapter, if they come from another
-  address in the network and are addressed to the adapter's own address.
+  address in the network and are addressed to the adapter's own address,
+  the network's broadcast address or a multicast group.
 
 When the app says stop, or its end of the pipe closes because it exited or
 crashed, the helper removes the adapter and exits.
@@ -25,7 +26,7 @@ from pathlib import Path
 
 from steamlan.adapter import protocol
 from steamlan.adapter.adapter import AdapterError, VirtualAdapter
-from steamlan.adapter.ipv4 import ip_version, is_member_address, parse_ipv4_header
+from steamlan.adapter.ipv4 import ip_version, may_deliver
 from steamlan.adapter.windows import assign_ipv4
 from steamlan.adapter.wintun import (
     ERROR_BUFFER_OVERFLOW,
@@ -49,14 +50,10 @@ class HelperError(Exception):
 
 def may_write(packet: bytes, address: ipaddress.IPv4Address) -> bool:
     """Whether a packet from the app may go to Windows: IPv4 from another
-    address in the network to this adapter's own address."""
-    try:
-        header = parse_ipv4_header(packet)
-    except ValueError:
-        return False
-    source = ipaddress.IPv4Address(header.source)
-    destination = ipaddress.IPv4Address(header.destination)
-    return destination == address and source != address and is_member_address(source)
+    address in the network, to this adapter's own address, the network's
+    broadcast address or a multicast group (ipv4.may_deliver). The app checks
+    this too; the helper doesn't rely on it."""
+    return may_deliver(packet, address) is not None
 
 
 class Channel:

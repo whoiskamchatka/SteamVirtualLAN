@@ -32,6 +32,9 @@ class Peer:
     # When to connect again after the connection dropped; None never (the
     # connection was closed on purpose, e.g. access was denied).
     retry_at: float | None = None
+    # Whether any connection to this peer was ever up: a connection that is
+    # down again is "reconnecting" rather than "connecting".
+    was_connected: bool = False
 
 
 class LobbySession:
@@ -50,6 +53,9 @@ class LobbySession:
         self.local_id = steam.steam_id
         self.log = log
         self.peers: dict[int, Peer] = {}
+        # While paused (this PC lost its connection to Steam), no connections
+        # are started; existing ones are left to Steam.
+        self.paused = False
         # Messages read from connections just before they were closed.
         self._drained: list[tuple[int, bytes]] = []
         self.update_members()
@@ -105,7 +111,25 @@ class LobbySession:
         for peer in self.peers.values():
             self._close(peer, "session closed", linger)
 
+    def pause(self) -> None:
+        """Stop starting connections, e.g. while Steam is unreachable: they
+        could only fail."""
+        self.paused = True
+
+    def resume(self) -> None:
+        """Start again: follow the lobby as it is now, and reconnect at once to
+        every member whose connection dropped in the meantime. Connections
+        that are still up are kept, so none is ever doubled."""
+        self.paused = False
+        self.update_members()
+        now = self.clock()
+        for peer in self.peers.values():
+            if peer.retry_at is not None:
+                peer.retry_at = now
+
     def _connect(self) -> None:
+        if self.paused:
+            return
         now = self.clock()
         for peer in self.peers.values():
             if not peer.initiator or peer.connection:
@@ -133,6 +157,7 @@ class LobbySession:
             self._close(peer, f"connection identified as {event.remote_steam_id}")
         elif event.state is ConnectionState.CONNECTED and not peer.connected:
             peer.connected = True
+            peer.was_connected = True
             self.log(f"Connected to {peer.steam_id}")
         elif event.ended:
             self._close(peer, f"{event.state.name}, reason {event.end_reason}: {event.end_debug}")
@@ -151,10 +176,14 @@ class LobbySession:
             reason = "not a lobby member"
         elif peer.initiator:
             reason = "this side connects to that peer"
-        elif peer.connection:
-            reason = "already connected"
         else:
             reason = ""
+            if peer.connection:
+                # The other side only connects again once its own end of the
+                # old connection is gone, e.g. after it lost its connection to
+                # Steam; this side may not have noticed yet. Steam
+                # authenticated who is connecting, so the new one replaces it.
+                self._close(peer, "replaced by a new connection from the peer")
             try:
                 self.steam.accept_connection(event.connection)
             except SteamError as exc:

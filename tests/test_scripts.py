@@ -529,3 +529,113 @@ def test_scripts_load_steam_api_from_the_repository_root(scripts, monkeypatch):
     steam = scripts.local.local_client()
 
     assert Path(steam.dll_path) == SCRIPTS.parent / "steam_api64.dll"
+
+
+class FakeSocket:
+    def __init__(self, family, kind, port=40000, fail_bind=False):
+        self.options = {}
+        self.bound = None
+        self.sent = []
+        self.port = port
+        self.fail_bind = fail_bind
+        self.closed = False
+
+    def setsockopt(self, level, option, value):
+        self.options[(level, option)] = value
+
+    def bind(self, address):
+        if self.fail_bind and address[0] != "0.0.0.0":
+            raise OSError("The requested address is not valid in its context")
+        self.bound = address
+
+    def getsockname(self):
+        return (self.bound[0], self.port)
+
+    def sendto(self, data, address):
+        self.sent.append((data, address))
+
+    def close(self):
+        self.closed = True
+
+
+def fake_sockets(**options):
+    made = []
+
+    def factory(family, kind):
+        made.append(FakeSocket(family, kind, port=40000 + len(made), **options))
+        return made[-1]
+
+    return made, factory
+
+
+def test_discovery_probe_sockets(scripts):
+    import socket
+
+    made, factory = fake_sockets()
+    scripts.adapter.DiscoveryCheck(factory=factory)
+
+    bound_multicast = made[2]
+    assert bound_multicast.bound == ("10.77.0.1", 0)
+    assert bound_multicast.options[(socket.IPPROTO_IP, socket.IP_MULTICAST_IF)] == (
+        socket.inet_aton("10.77.0.1")
+    )
+    unbound_multicast = made[4]
+    assert unbound_multicast.bound == ("0.0.0.0", 0)
+    assert (socket.IPPROTO_IP, socket.IP_MULTICAST_IF) not in unbound_multicast.options
+    assert all(s.options[(socket.SOL_SOCKET, socket.SO_BROADCAST)] == 1 for s in made)
+
+
+def test_discovery_probes_are_sent_every_interval(scripts):
+    made, factory = fake_sockets()
+    now = [0.0]
+    check = scripts.adapter.DiscoveryCheck(factory=factory, clock=lambda: now[0])
+
+    check.send_due()
+    check.send_due()
+    now[0] = scripts.adapter.DISCOVERY_INTERVAL
+    check.send_due()
+
+    probes = scripts.adapter.PROBES
+    for probe, sock in zip(probes, made, strict=True):
+        assert (
+            sock.sent == [(probe.payload, (probe.destination, scripts.adapter.DISCOVERY_PORT))] * 2
+        )
+
+
+def test_discovery_recognizes_probes_that_reach_the_adapter(scripts):
+    from app_fakes import udp_packet
+
+    made, factory = fake_sockets()
+    check = scripts.adapter.DiscoveryCheck(factory=factory)
+    broadcast = scripts.adapter.PROBES[0]
+    port = made[0].port
+
+    arrived = udp_packet("10.77.0.1", "10.77.0.255", port, 47999, broadcast.payload)
+    note = check.observe(arrived)
+
+    assert note == (
+        f"  probe 'bound, network broadcast': 10.77.0.1:{port} -> 10.77.0.255:47999, "
+        "broadcast, ports and data unchanged"
+    )
+    changed = udp_packet(
+        "10.77.0.1", "239.255.255.250", 1, 47999, scripts.adapter.PROBES[2].payload
+    )
+    assert "CHANGED" in check.observe(changed)
+    assert check.observe(udp_packet("10.77.0.1", "10.77.0.255", 5, 6, b"a game")) is None
+    assert check.observe(b"\x60" + bytes(39)) is None
+
+    report = "\n".join(check.report())
+    assert "network broadcast to 10.77.0.255: arrived in the adapter" in report
+    assert "unbound, limited broadcast to 255.255.255.255: never arrived" in report
+
+
+def test_discovery_reports_probes_that_could_not_be_sent(scripts):
+    made, factory = fake_sockets(fail_bind=True)
+    check = scripts.adapter.DiscoveryCheck(factory=factory)
+    check.send_due()
+    check.close()
+
+    report = "\n".join(check.report())
+    assert "bound, multicast to 239.255.255.250: could not be sent" in report
+    assert "unbound, multicast to 239.255.255.250: never arrived" in report
+    assert all(sock.closed for sock in made if sock.bound)

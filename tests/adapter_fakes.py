@@ -9,12 +9,12 @@ from steamlan.adapter import protocol
 from steamlan.adapter.adapter import AdapterError
 
 
-def ipv4_packet(source, destination, payload=b"ping"):
+def ipv4_packet(source, destination, payload=b"ping", protocol=1):
     header = bytearray(20)
     header[0] = 0x45
     header[2:4] = (20 + len(payload)).to_bytes(2, "big")
     header[8] = 128
-    header[9] = 1
+    header[9] = protocol
     header[12:16] = IPv4Address(source).packed
     header[16:20] = IPv4Address(destination).packed
     return bytes(header) + payload

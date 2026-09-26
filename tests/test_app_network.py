@@ -183,7 +183,7 @@ def test_member_going_offline_keeps_its_address():
     admit(steam, network, GUEST)
 
     steam.members.remove(GUEST)
-    network.process([member_update(GUEST, ChatMemberStateChange.DISCONNECTED)])
+    network.process([member_update(GUEST, ChatMemberStateChange.LEFT)])
     admit(steam, network, OTHER)
 
     assert network.roster == {HOST: A1, GUEST: A2, OTHER: A3}
@@ -545,8 +545,32 @@ def test_lost_connection_to_a_member_that_is_still_there(state):
     network.process([status(connection, state, HOST, LISTEN_SOCKET)])
 
     host = views(network)[HOST]
-    assert (host.status, host.online) == ("Connecting", True)
+    assert (host.status, host.online, host.latency) == ("Reconnecting...", True, "")
     assert network.status() == ("Online", "ok")
+
+
+def test_member_that_drops_out_of_the_lobby_lost_its_connection():
+    steam, network = coordinator(members=(HOST, GUEST, OTHER))
+    admit(steam, network, GUEST)
+    admit(steam, network, OTHER)
+
+    steam.members.remove(GUEST)
+    steam.members.remove(OTHER)
+    network.process(
+        [
+            member_update(GUEST, ChatMemberStateChange.DISCONNECTED),
+            member_update(OTHER, ChatMemberStateChange.LEFT),
+        ]
+    )
+
+    assert views(network)[GUEST].status == "Lost connection"
+    assert views(network)[OTHER].status == "Offline"
+    assert not views(network)[GUEST].online
+    assert network.roster == {HOST: A1, GUEST: A2, OTHER: A3}
+
+    steam.members.append(GUEST)
+    network.process([member_update(GUEST)])
+    assert views(network)[GUEST].status == "Connecting..."
 
 
 def test_unknown_names_use_a_placeholder_and_known_ones_are_remembered():
@@ -584,7 +608,7 @@ def test_coordinator_sends_packets_to_the_member_that_owns_the_destination():
     assert network.send_packet(to_guest)
     assert network.send_packet(to_other)
 
-    assert steam.unreliable == [
+    assert steam.packets == [
         (guest, tunnel.PACKET_PREFIX + to_guest),
         (other, tunnel.PACKET_PREFIX + to_other),
     ]
@@ -594,22 +618,28 @@ def test_coordinator_sends_packets_to_the_member_that_owns_the_destination():
     "packet",
     [
         ipv4_packet(A1, A4),  # nobody has this address
-        ipv4_packet(A1, "10.77.0.255"),  # broadcast
-        ipv4_packet(A1, "224.0.0.251"),  # multicast
+        ipv4_packet(A1, "10.77.0.0"),  # the network's own address
         ipv4_packet(A1, "192.168.1.1"),  # outside the network
         ipv4_packet(A1, A1),  # to itself
         ipv4_packet(A3, A2),  # not from this member's address
+        ipv4_packet(A3, "10.77.0.255"),  # broadcast, not from this member's address
+        ipv4_packet("0.0.0.0", "255.255.255.255"),  # e.g. DHCP
+        ipv4_packet(A2, "239.255.255.250"),  # multicast, not from this member
+        ipv4_packet(A1, "224.0.0.22", protocol=2),  # IGMP
         ipv4_packet(A1, A2)[:19],  # truncated
         b"\x60" + bytes(39),  # IPv6
         b"",
     ],
     ids=[
         "unknown",
-        "broadcast",
-        "multicast",
+        "network address",
         "outside",
         "self",
         "foreign source",
+        "foreign broadcast",
+        "unconfigured source",
+        "foreign multicast",
+        "igmp",
         "truncated",
         "ipv6",
         "empty",
@@ -620,7 +650,7 @@ def test_packets_that_cannot_be_routed_are_dropped(packet):
     admit(steam, network, GUEST)
 
     assert not network.send_packet(packet)
-    assert steam.unreliable == []
+    assert steam.packets == []
     assert network.dropped_packets == 1
 
 
@@ -629,7 +659,7 @@ def test_packets_go_only_to_members():
     connect(steam, network, GUEST)
 
     assert not network.send_packet(ipv4_packet(A1, A2))
-    assert steam.unreliable == []
+    assert steam.packets == []
 
 
 def test_packets_for_an_offline_member_are_dropped():
@@ -647,7 +677,7 @@ def test_member_cannot_send_before_it_has_an_address():
     connect_to_owner(steam, network)
 
     assert not network.send_packet(ipv4_packet(A2, A1))
-    assert steam.unreliable == []
+    assert steam.packets == []
 
 
 def test_members_send_to_each_other_directly_not_through_the_coordinator():
@@ -660,7 +690,7 @@ def test_members_send_to_each_other_directly_not_through_the_coordinator():
     assert network.send_packet(ipv4_packet(A2, A3))
     assert network.send_packet(ipv4_packet(A2, A1))
 
-    assert [connection for connection, _ in steam.unreliable] == [other, host]
+    assert [connection for connection, _ in steam.packets] == [other, host]
 
 
 def test_packets_are_not_sent_while_the_connection_is_down():
@@ -687,13 +717,28 @@ def test_member_accepts_packets_from_their_owner():
     "packet",
     [
         ipv4_packet(A3, A2),  # pretending to be another member
+        ipv4_packet(A3, "10.77.0.255"),  # a broadcast pretending the same
+        ipv4_packet(A3, "239.255.255.250"),  # a multicast pretending the same
+        ipv4_packet(A2, "255.255.255.255"),  # pretending to be this member
         ipv4_packet(A1, A3),  # addressed to someone else
-        ipv4_packet(A1, "10.77.0.255"),
+        ipv4_packet(A1, "10.77.0.0"),
+        ipv4_packet(A1, "224.0.0.22", protocol=2),  # IGMP
         ipv4_packet("192.168.1.1", A2),
         ipv4_packet(A1, A2)[:10],
         b"\x60" + bytes(39),
     ],
-    ids=["spoofed source", "other destination", "broadcast", "outside", "truncated", "ipv6"],
+    ids=[
+        "spoofed source",
+        "spoofed broadcast",
+        "spoofed multicast",
+        "own source",
+        "other destination",
+        "network address",
+        "igmp",
+        "outside",
+        "truncated",
+        "ipv6",
+    ],
 )
 def test_member_drops_packets_that_do_not_fit_their_sender(packet):
     steam, network = member()
@@ -733,3 +778,80 @@ def test_packets_and_control_messages_never_mix():
     network.process([])
     assert network.joined
     assert network.take_packets() == []
+
+
+# Broadcast and multicast (test_app_broadcast.py has whole networks)
+
+BROADCASTS = ["10.77.0.255", "255.255.255.255", "239.255.255.250"]
+
+
+@pytest.mark.parametrize("destination", BROADCASTS)
+def test_flooding_skips_members_not_admitted_or_not_connected(destination):
+    steam, network = coordinator(members=(HOST, GUEST, OTHER, STRANGER))
+    guest = admit(steam, network, GUEST)
+    # OTHER is connected but hasn't shown a code; STRANGER isn't connected.
+    connect(steam, network, OTHER)
+    packet = ipv4_packet(A1, destination, b"discover", protocol=17)
+
+    assert network.send_packet(packet) == 1
+
+    assert steam.packets == [(guest, tunnel.packet_message(packet))]
+    assert network.traffic.snapshot()["tx_copies"] == 1
+
+
+def test_flooding_with_nobody_connected_is_counted_as_dropped():
+    steam, network = coordinator(members=(HOST,))
+
+    assert network.send_packet(ipv4_packet(A1, "10.77.0.255")) == 0
+
+    assert network.traffic.snapshot()["dropped"] == {"tx_no_recipients": 1}
+
+
+@pytest.mark.parametrize("destination", BROADCASTS)
+def test_received_broadcast_goes_to_windows_and_nowhere_else(destination):
+    steam, network = member(members=(HOST, GUEST, OTHER))
+    host = connect_to_owner(steam, network)
+    other = [c[1] for c in steam.called("connect_p2p") if c[0] == OTHER][0]
+    network.process([status(other, ConnectionState.CONNECTED, OTHER)])
+    accepted(steam, network, {HOST: A1, GUEST: A2, OTHER: A3}, connection=host)
+    packet = ipv4_packet(A1, destination, b"discover", protocol=17)
+    steam.unreliable.clear()
+
+    steam.inbox[host] = [tunnel.packet_message(packet)]
+    network.process([])
+
+    assert network.take_packets() == [packet]
+    # Not a single attempt to send it on, not even one the rules would stop.
+    assert steam.packets == []
+    snapshot = network.traffic.snapshot()
+    assert sum(snapshot["tx"].values()) == 0 and snapshot["dropped"] == {}
+
+
+@pytest.mark.parametrize("destination", BROADCASTS)
+def test_broadcast_from_someone_not_admitted_is_rejected(destination):
+    steam, network = coordinator()
+    connection = connect(steam, network, GUEST)
+
+    steam.inbox[connection] = [tunnel.packet_message(ipv4_packet(A2, destination))]
+    network.process([])
+
+    assert network.take_packets() == []
+    assert network.traffic.snapshot()["dropped"] == {"rx_rejected": 1}
+
+
+def test_ping_inside_a_packet_is_not_answered_and_never_reaches_windows():
+    steam, network = member()
+    connection = accepted(steam, network)
+    steam.unreliable.clear()
+
+    steam.inbox[connection] = [tunnel.packet_message(access.ping_message(5))]
+    network.process([])
+    assert network.take_packets() == []
+    assert (connection, access.pong_message(5)) not in steam.unreliable
+    assert network.traffic.snapshot()["dropped"] == {"rx_rejected": 1}
+
+    # A real PING is answered and never reaches Windows either.
+    steam.inbox[connection] = [access.ping_message(6)]
+    network.process([])
+    assert network.take_packets() == []
+    assert (connection, access.pong_message(6)) in steam.unreliable

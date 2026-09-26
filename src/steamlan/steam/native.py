@@ -273,6 +273,9 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         lib.SteamAPI_ISteamUser_GetSteamID.argtypes = [ctypes.c_void_p]
         lib.SteamAPI_ISteamUser_GetSteamID.restype = ctypes.c_uint64
 
+        lib.SteamAPI_ISteamUser_BLoggedOn.argtypes = [ctypes.c_void_p]
+        lib.SteamAPI_ISteamUser_BLoggedOn.restype = ctypes.c_bool
+
         lib.SteamAPI_SteamFriends_v018.argtypes = []
         lib.SteamAPI_SteamFriends_v018.restype = ctypes.c_void_p
 

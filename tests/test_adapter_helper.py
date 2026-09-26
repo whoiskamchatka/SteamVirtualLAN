@@ -132,8 +132,12 @@ def test_packets_before_the_address_is_set_are_dropped():
         ipv4_packet(A2, A2),  # claims to come from this adapter
         ipv4_packet("192.168.1.1", A2),  # from outside the network
         ipv4_packet("10.77.0.255", A2),
-        ipv4_packet(A1, "10.77.0.255"),
-        ipv4_packet(A1, "224.0.0.251"),
+        ipv4_packet(A2, "10.77.0.255"),  # its own broadcast, back again
+        ipv4_packet(A2, "239.255.255.250"),  # its own multicast, back again
+        ipv4_packet("192.168.1.1", "255.255.255.255"),
+        ipv4_packet(A1, "224.0.0.22", protocol=2),  # IGMP
+        ipv4_packet(A1, "10.77.0.0"),  # the network's own address
+        ipv4_packet(A1, "8.8.8.8"),
         ipv4_packet(A1, A2)[:12],
         b"\x60" + bytes(39),
         b"",
@@ -143,8 +147,12 @@ def test_packets_before_the_address_is_set_are_dropped():
         "own source",
         "outside",
         "broadcast source",
-        "broadcast",
-        "multicast",
+        "own broadcast",
+        "own multicast",
+        "broadcast from outside",
+        "igmp",
+        "network address",
+        "internet",
         "truncated",
         "ipv6",
         "empty",
@@ -158,6 +166,19 @@ def test_the_helper_writes_nothing_else_to_windows(data):
     assert adapter.written == []
     assert helper.dropped_packets == 1
     assert not may_write(data, IPv4Address(A2))
+
+
+@pytest.mark.parametrize(
+    "destination", ["10.77.0.255", "255.255.255.255", "239.255.255.250", "224.0.0.251"]
+)
+def test_the_helper_writes_broadcast_and_multicast_from_other_members(destination):
+    adapter = FakeAdapter()
+    data = ipv4_packet(A1, destination, b"discovery", protocol=17)
+
+    _, _, helper = run_helper(set_address(A2), packet(data), adapter=adapter)
+
+    assert adapter.written == [data]
+    assert helper.dropped_packets == 0
 
 
 def test_full_adapter_drops_the_packet():

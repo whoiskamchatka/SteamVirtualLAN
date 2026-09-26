@@ -1,5 +1,6 @@
-"""The virtual network's addresses, and just enough of the IPv4 header to route packets."""
+"""The virtual network's addresses, and just enough of the IPv4 header to deliver packets."""
 
+import enum
 import ipaddress
 from dataclasses import dataclass
 
@@ -29,6 +30,81 @@ class IPv4Header:
     @property
     def protocol_name(self) -> str:
         return PROTOCOLS.get(self.protocol, f"protocol {self.protocol}")
+
+
+class Delivery(enum.Enum):
+    """How an IPv4 packet is delivered on the virtual network, by its destination."""
+
+    UNICAST = "unicast"  # one member's address in VIRTUAL_NETWORK
+    BROADCAST = "broadcast"  # NETWORK_BROADCAST or LIMITED_BROADCAST: every member
+    MULTICAST = "multicast"  # 224.0.0.0/4: every member (there is no IGMP tracking)
+
+
+# The virtual network's own broadcast address, 10.77.0.255, and "everyone on
+# this link", 255.255.255.255.
+NETWORK_BROADCAST = VIRTUAL_NETWORK.broadcast_address
+LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+MULTICAST_NETWORK = ipaddress.IPv4Network("224.0.0.0/4")
+# IGMP is how a host tells multicast routers which groups it wants. Every
+# multicast packet goes to every member anyway, so it is never carried.
+IGMP = 2
+
+
+@dataclass(frozen=True)
+class Addressing:
+    source: ipaddress.IPv4Address
+    destination: ipaddress.IPv4Address
+    protocol: int
+    # None: the destination is nothing the virtual network delivers to
+    # (outside it, its network address, ...).
+    delivery: Delivery | None
+
+
+def addressing(packet: bytes) -> Addressing | None:
+    """Source, destination and delivery of an IPv4 packet; None for anything
+    that isn't a well-formed IPv4 packet (IPv6 included)."""
+    try:
+        header = parse_ipv4_header(packet)
+    except ValueError:
+        return None
+    destination = ipaddress.IPv4Address(header.destination)
+    if destination in (NETWORK_BROADCAST, LIMITED_BROADCAST):
+        delivery = Delivery.BROADCAST
+    elif destination in MULTICAST_NETWORK:
+        delivery = Delivery.MULTICAST
+    elif is_member_address(destination):
+        delivery = Delivery.UNICAST
+    else:
+        delivery = None
+    return Addressing(ipaddress.IPv4Address(header.source), destination, header.protocol, delivery)
+
+
+def may_deliver(
+    packet: bytes,
+    local_address: ipaddress.IPv4Address | None,
+    sender_address: ipaddress.IPv4Address | None = None,
+) -> Delivery | None:
+    """How a packet that came from another member may be handed to Windows
+    on the member with local_address; None if it may not.
+
+    It must come from another member's address (sender_address, when the
+    member that sent it is known: exactly that address), and be addressed to
+    this member alone, to the network's broadcast address or to a multicast
+    group. The packet itself is never changed.
+    """
+    info = addressing(packet)
+    if info is None or info.delivery is None or local_address is None:
+        return None
+    source = info.source
+    if not is_member_address(source) or source == local_address:
+        return None
+    if sender_address is not None and source != sender_address:
+        return None
+    if info.protocol == IGMP:
+        return None
+    if info.delivery is Delivery.UNICAST and info.destination != local_address:
+        return None
+    return info.delivery
 
 
 def ip_version(packet: bytes) -> int | None:

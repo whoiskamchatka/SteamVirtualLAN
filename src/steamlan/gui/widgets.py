@@ -143,6 +143,11 @@ class MemberRow(QFrame):
         self.address = label(name="address")
         self.address.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.address, 0, Qt.AlignmentFlag.AlignVCenter)
+        # Round-trip time; empty for this PC's own row and members not connected.
+        self.latency = label(name="latency")
+        self.latency.setMinimumWidth(48)
+        self.latency.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.latency, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def show_member(self, member: MemberView) -> None:
         self.name.setText(member.name)
@@ -150,6 +155,7 @@ class MemberRow(QFrame):
         self.you_badge.setVisible(member.is_you)
         self.status.set(member.status, member.tone)
         self.address.setText(member.address)
+        self.latency.setText(member.latency)
         set_style_name(self.name, "memberName" if member.online else "memberNameOffline")
         set_style_name(self.address, "address" if member.online else "addressOffline")
         self.setToolTip(f"SteamID {member.steam_id}")

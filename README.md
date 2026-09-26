@@ -8,7 +8,7 @@ The project is still very early in development.
 
 ## Status
 
-Nothing usable yet. The desktop app creates and joins networks of Steam friends, connects the members to each other over Steam, gives every member a virtual IP address (10.77.0.x) on its own virtual network adapter and carries IPv4 packets directly between them. It keeps running in the notification area, remembers its network between runs and doesn't depend on the member that created the network. Carrying packets between two PCs has not been tested yet; broadcast and multicast (which many games use to find LAN servers) are not carried.
+Nothing usable yet. The desktop app creates and joins networks of Steam friends, connects the members to each other over Steam, gives every member a virtual IP address (10.77.0.x) on its own virtual network adapter and carries IPv4 packets directly between them. It keeps running in the notification area, remembers its network between runs and doesn't depend on the member that created the network. Carrying packets between two PCs, including the broadcast and multicast that many games use to find LAN servers, has not been tested yet.
 
 Windows is the initial target.
 
@@ -42,11 +42,17 @@ python -m steamlan
 
 Create Network starts a network and shows its Lobby ID and access code. Invite Steam Friend opens the Steam overlay, where you pick friends to invite; the invite carries the lobby and access code, and the friend accepts it in Steam while the app is open on their PC. Anyone else can join with Join Network, using the Lobby ID and access code. Every member of a network knows its access code and can invite others. The code only exists in the members' apps, their saved network state (see below) and the invites they send, and is checked over the encrypted Steam connection; it is never stored in the lobby.
 
-All members of a network are equal. The member list shows everyone's name, virtual IP address and whether they are Online or Offline; only your own row is marked, with "You".
+All members of a network are equal. The member list shows everyone's name, virtual IP address, whether they are Online or Offline and, for members you are connected to, the round-trip time to them (for example `24 ms`; `— ms` until the first measurement); only your own row is marked, with "You". The time is measured by SteamVirtualLAN itself: every 2 seconds it sends each connected member a small PING over the same Steam connection the packets use and times the answer with this PC's clock. Ping times never affect who is a member.
+
+Besides Online and Offline, a member can be Connecting... or Reconnecting... (in the network, but the direct connection to it isn't up yet, or dropped and is being made again) or have Lost connection (it dropped out without going offline, e.g. its internet went away).
 
 Going online in a network also brings up SteamVirtualLAN's virtual network adapter (see below). Windows asks for Administrator permission for it with its UAC prompt; the app itself, with Steam and the window, keeps running without Administrator rights, and only a small helper process started through the prompt owns the adapter. If the permission is not given, the app goes offline again and says why.
 
-Every member gets its own address, which it keeps until it leaves the network for good: the member that creates a network is 10.77.0.1, and the others get the lowest free address when they are first admitted. Packets Windows sends to another member's address go into the adapter, through the helper to the app, and over a direct Steam connection to that member, whose app hands them to its own adapter and so to Windows. They never pass through a third member. A member only accepts packets from the address that belongs to the member that sent them, and only for its own address. Only IPv4 packets between two members' addresses are carried.
+Every member gets its own address, which it keeps until it leaves the network for good: the member that creates a network is 10.77.0.1, and the others get the lowest free address when they are first admitted. Packets Windows sends to another member's address go into the adapter, through the helper to the app, and over a direct Steam connection to that member, whose app hands them to its own adapter and so to Windows. They never pass through a third member. A member only accepts packets from the address that belongs to the member that sent them, so nobody can pretend to be another member.
+
+Broadcast and multicast are carried too, since many games find each other on a LAN that way: packets Windows sends to the network's broadcast address 10.77.0.255, to 255.255.255.255 or to an IPv4 multicast group (224.0.0.0/4) go, one copy each, to every member this PC is connected to right now, straight from this PC; members that are offline or still connecting get none. Every packet arrives exactly as Windows sent it, addresses, ports and data unchanged. A member hands broadcast and multicast from others only to its own Windows and never sends them on, so they can't go round in circles. There is no tracking of which multicast groups anyone listens to (IGMP isn't carried): with at most 8 members online, every member gets every group's packets, and Windows ignores the ones nothing listens to. Only IPv4 is carried; the network is IP-only, with no Ethernet, ARP or DHCP.
+
+Windows only sends a packet into the SteamVirtualLAN adapter if its routing picks that adapter. For 10.77.0.255 and for programs that bind to their 10.77.0.x address it does. A program that sends to 255.255.255.255 or a multicast group without choosing an adapter gets whichever adapter Windows prefers, which may be the real network adapter instead; the adapter diagnostic below shows which it is on a PC.
 
 ### Closing, going offline, exiting and leaving
 
@@ -54,6 +60,10 @@ Every member gets its own address, which it keeps until it leaves the network fo
 - **Go Offline** makes this PC unavailable in the network: the adapter is removed and the app leaves the Steam lobby and closes its connections, but you stay a member and keep your address. It stays offline, also across restarts, until you choose Go Online. Online and Offline are SteamVirtualLAN's own, unrelated to your status in Steam's friends list.
 - **Exit** (in the tray menu) stops the app: the adapter, the connections and Steam. It does not leave the network. The next time the app starts it goes back online in the same network, with the same address, by itself.
 - **Leave Network** leaves for good. The other members are told, so that your address is freed, and the app forgets the network; to come back you need an invite or the access code again. Leaving while offline goes online briefly, without the adapter, only to tell the network.
+
+### When your own connection drops
+
+If your internet or Steam's connection goes away while you are in a network, SteamVirtualLAN doesn't know anything about the other members, so it doesn't pretend to: the network page stays as it was last seen, greyed out behind a "Restoring connection..." overlay, and the tray shows "Restoring connection...". The virtual adapter stays up. When Steam is reachable again (`ISteamUser::BLoggedOn`), the app gets back into the network's lobby by itself, joining it again if Steam dropped you from it, reconnects to the other members and removes the overlay; you keep your address. Getting back into the lobby is retried with growing pauses (2, 4, 8, then every 15 seconds) for up to 90 seconds after Steam is back; after that the app gives up, goes offline and says so, and the next start tries again. If Steam says the lobby no longer exists, it tells you right away that the network is no longer available. Go Offline, in the overlay or the tray, stops all of this; after Go Offline nothing reconnects by itself.
 
 ### Saved network state
 
@@ -130,6 +140,14 @@ ping 10.77.0.2
 ```
 
 The diagnostic should print `IPv4 ICMP 10.77.0.1 -> 10.77.0.2` for every ping. With `--reply` it also answers them itself, so ping should show replies from 10.77.0.2 (the app never does this; there, replies come from the other PC). Stop it with Ctrl+C; the adapter is removed when it stops. `--remove-driver` also uninstalls Wintun's driver afterwards if nothing else uses it.
+
+To see what Windows does with LAN discovery traffic, run it with `--discovery` instead:
+
+```powershell
+python scripts/check_adapter.py --discovery
+```
+
+Every 2 seconds it then sends small UDP datagrams to 10.77.0.255, 255.255.255.255 and the multicast group 239.255.255.250, some from a socket bound to 10.77.0.1 and some from an unbound one, like many games, and marks those that Windows put into the adapter, with their ports and whether their bytes are unchanged. When stopped it lists which probes arrived and which Windows sent elsewhere. The probes only reach this PC's own adapter.
 
 ## Disclaimer
 

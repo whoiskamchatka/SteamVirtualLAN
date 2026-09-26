@@ -413,3 +413,84 @@ def test_second_instance_asks_the_first_to_show_itself(app):
     third = SingleInstance(name)
     assert third.claim()
     third.close()
+
+
+# Restoring the connection
+
+RESTORING = View(
+    Screen.NETWORK,
+    True,
+    "",
+    "ok",
+    presence=Presence.RESTORING,
+    lobby_id=LOBBY,
+    access_code="7K2QD-M9XTE",
+    network_status="Restoring connection...",
+    network_tone="pending",
+    members=MEMBERS,
+    overlay="Restoring connection...",
+    overlay_detail="SteamVirtualLAN is reconnecting",
+)
+
+
+def test_restoring_covers_the_network_page(window):
+    window, controller = window
+    window.resize(460, 600)
+    window.show()
+    show(window, controller, RESTORING)
+
+    page = window.network
+    assert page.overlay.isVisible()
+    assert page.overlay.geometry() == page.rect()
+    assert page.overlay.title.text() == "Restoring connection..."
+    assert page.overlay.detail.text() == "SteamVirtualLAN is reconnecting"
+    assert not page.content.isEnabled()
+    assert page._dim.isEnabled()
+    # The members stay visible behind it, as last seen.
+    assert [row.address.text() for row in page._rows.values()] == [
+        "10.77.0.2",
+        "10.77.0.1",
+        "10.77.0.3",
+    ]
+    assert window.tray.status_action.text() == "Restoring connection..."
+    assert window.tray.toggle_action.text() == "Go Offline"
+
+
+def test_recovery_removes_the_overlay(window):
+    window, controller = window
+    window.show()
+    show(window, controller, RESTORING)
+
+    show(window, controller, ONLINE)
+
+    page = window.network
+    assert page.overlay.isHidden()
+    assert page.content.isEnabled()
+    assert not page._dim.isEnabled()
+    assert window.tray.status_action.text() == "Online · 10.77.0.2"
+
+
+def test_overlay_can_go_offline(window):
+    window, controller = window
+    window.show()
+    show(window, controller, RESTORING)
+
+    window.network.overlay.offline_button.click()
+
+    assert ("go_offline",) in controller.calls
+
+
+def test_members_show_their_latency(window):
+    window, controller = window
+    members = (
+        MemberView(2, "Me", True, True, "Online", "ok", "10.77.0.2"),
+        MemberView(1, "Friend", False, True, "Online", "ok", "10.77.0.1", "24 ms"),
+        MemberView(3, "Carol", False, True, "Online", "ok", "10.77.0.3", "— ms"),
+        MemberView(4, "Dave", False, True, "Reconnecting...", "pending", "10.77.0.4"),
+    )
+
+    show(window, controller, View(**{**ONLINE.__dict__, "members": members}))
+
+    rows = window.network._rows
+    assert [rows[n].latency.text() for n in (2, 1, 3, 4)] == ["", "24 ms", "— ms", ""]
+    assert rows[4].status.text.text() == "Reconnecting..."

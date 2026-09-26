@@ -1,7 +1,10 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLineEdit,
+    QProgressBar,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -137,6 +140,52 @@ class JoinPage(QWidget):
             self.submit.emit(self.lobby_id.text(), self.access_code.text())
 
 
+class RestoringOverlay(QFrame):
+    """Covers the network page while the connection is being restored, the
+    way Steam covers its windows when it loses its connection."""
+
+    go_offline = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("overlay")
+        outer = QVBoxLayout(self)
+        outer.addStretch(1)
+        panel, layout = card()
+        panel.setObjectName("overlayCard")
+        layout.setContentsMargins(28, 24, 28, 20)
+        layout.setSpacing(10)
+        self.title = label("Restoring connection...", "heading")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title)
+        self.detail = label("SteamVirtualLAN is reconnecting", "muted", True)
+        self.detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.detail)
+        busy = QProgressBar()
+        busy.setObjectName("busy")
+        busy.setRange(0, 0)
+        busy.setTextVisible(False)
+        busy.setFixedHeight(4)
+        layout.addWidget(busy)
+        self.offline_button = button("Go Offline", "link")
+        self.offline_button.clicked.connect(self.go_offline)
+        layout.addWidget(self.offline_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(panel)
+        row.addStretch(1)
+        outer.addLayout(row)
+        outer.addStretch(1)
+        self.hide()
+
+    def show_restoring(self, title: str, detail: str) -> None:
+        self.title.setText(title)
+        self.detail.setText(detail)
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+
+
 class NetworkPage(QWidget):
     invite = Signal()
     toggle_online = Signal()
@@ -144,7 +193,20 @@ class NetworkPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # Everything but the overlay, so that it alone can be dimmed and
+        # disabled while the connection is restored.
+        self.content = QWidget()
+        outer.addWidget(self.content)
+        self._dim = QGraphicsOpacityEffect(self.content)
+        self._dim.setOpacity(0.35)
+        self._dim.setEnabled(False)
+        self.content.setGraphicsEffect(self._dim)
+        self.overlay = RestoringOverlay(self)
+        self.overlay.go_offline.connect(self.toggle_online)
+
+        layout = QVBoxLayout(self.content)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(14)
 
@@ -205,7 +267,19 @@ class NetworkPage(QWidget):
         buttons.addWidget(self.leave_button)
         layout.addLayout(buttons)
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.overlay.setGeometry(self.rect())
+
     def render(self, view: View) -> None:
+        restoring = bool(view.overlay)
+        if restoring:
+            self.overlay.show_restoring(view.overlay, view.overlay_detail)
+        else:
+            self.overlay.hide()
+        # The members behind the overlay are only as last seen.
+        self.content.setEnabled(not restoring)
+        self._dim.setEnabled(restoring)
         self.status.set(view.network_status, view.network_tone)
         self.lobby_id.set_value(str(view.lobby_id))
         self.access_code.set_value(view.access_code)
